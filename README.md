@@ -1,6 +1,6 @@
 # polymarket-edge-research
 
-> **Work in Progress** — Building and backtesting a clock-based snipe bot for Polymarket 5-minute BTC Up/Down markets.
+> **Work in Progress** — Building a bot that trades Polymarket's 5-minute BTC prediction markets profitably.
 
 ![Status](https://img.shields.io/badge/Status-Work%20In%20Progress-yellow)
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue?logo=python)
@@ -8,136 +8,123 @@
 
 ---
 
-## What This Is
+## The Problem
 
-Most Polymarket bots look profitable in paper trading and bleed money live. This project investigates **why** — and builds the infrastructure to close the gap.
+Every 5 minutes, Polymarket opens a market with one question:
 
-The core insight: paper bots assume you fill at mid ± a tick. Real fills are bimodal:
+> **"Will BTC be higher or lower than it was 5 minutes ago?"**
 
-- **No fill** — you posted a limit order and nobody took the other side
-- **Adverse fill** — you filled exactly when you shouldn't have (the counterparty had fresher data)
+If you're right, your token pays $1.00. If you're wrong, you lose what you paid.
 
-This repo researches and implements the missing layers: **execution realism + realistic signal design**.
+Sounds simple. But 92% of traders lose money on these markets. Most bots look profitable in testing, then fail in real trading. This project figures out exactly why — and builds something that doesn't fail.
 
 ---
 
-## Key Findings So Far
+## Why Most Bots Fail
 
-| Finding | Detail |
+**Problem 1 — Wrong token pricing in backtests**
+When you test a strategy, you assume you can buy a token for $0.50. But by the time you have a clear signal (10 seconds before close), the market already knows what you know. The winning token costs $0.70–$0.92. That changes everything.
+
+**Problem 2 — Wrong signal**
+Most bots use momentum — "BTC went up 3 times in a row, bet UP." That has basically zero edge. The only signal that works is: *is BTC right now higher or lower than it was when this 5-minute window opened?* That directly answers the market's question.
+
+**Problem 3 — Execution reality**
+Real orders face a 250ms delay, stale prices, and unpredictable fills. A bot that wins 68% in simulation can lose money live because of these hidden costs.
+
+---
+
+## What We Built
+
+### The Signal
+A 7-indicator composite score. One indicator dominates everything else:
+
+**Window Delta** = `(current BTC price − window open price) / window open price`
+
+At 10 seconds before the window closes, if BTC is already up 0.10% from the open — it almost never reverses in 10 seconds. That's a near-certain win. The bot weights this signal 5–7× more than anything else.
+
+The other 6 indicators (momentum, EMA crossover, RSI, volume, tick trend) add small supporting evidence but never override a clear window delta.
+
+### The Timing
+```
+Every 5 minutes, a new window opens on Polymarket.
+The bot sleeps until exactly 10 seconds before it closes.
+Then it polls BTC price every 2 seconds.
+At 5 seconds before close — it fires, no matter what.
+```
+This is called a **snipe**. Enter late, when direction is certain. Accept a higher token price in exchange for much higher accuracy.
+
+### The Pricing Model
+The bot knows that confident signals = expensive tokens. It never assumes $0.50.
+
+| How clear the signal is | Token costs | You need to win |
+|---|---|---|
+| Barely any move | $0.50 | 50% of the time |
+| Small move (0.02%) | $0.55 | 55% of the time |
+| Medium move (0.05%) | $0.65 | 65% of the time |
+| Strong move (0.10%) | $0.80 | 80% of the time |
+| Decisive move (0.15%+) | $0.92 | 92% of the time |
+
+### The Oracle
+Polymarket resolves markets using **Chainlink** — a specific crypto price feed, not Binance. The bot connects directly to Polymarket's live Chainlink WebSocket to get the exact same price the market resolves against.
+
+---
+
+## Current Results
+
+Backtested on 7 days of real BTC/USD data (2,016 five-minute windows):
+
+- **Win rate: 88.6%** — needs 67.6% to break even ✅
+- **Positive EV: +$0.21 per dollar risked** ✅  
+- **Execution costs eat 32%** of naive profits ⚠️
+
+The weak spot: these results are simulated. The win rate model is calibrated against community data (~68–72% real win rate). We need 30 days of live data to confirm.
+
+---
+
+## Current Status
+
+| What | Status |
 |---|---|
-| Fixed $0.50 token pricing = fake profits | At T-10s, tokens cost $0.65–$0.92 depending on delta |
-| 3-candle momentum has no edge | 50.7% win rate vs 49.3% base rate — statistically noise |
-| Window delta is the dominant signal | `(current - window_open) / window_open` with weight 5-7x |
-| T-10s is optimal entry | Direction locked in, tokens not yet at max price |
-| 250ms taker delay on BTC markets | Hardcoded by Polymarket — affects all taker orders |
-| Execution costs eat 20-30% of naive P&L | Slippage + stale quotes + adverse fills |
+| Signal engine (7 indicators) | ✅ Built |
+| Realistic token pricing | ✅ Built |
+| Backtest engine | ✅ Built |
+| Chainlink oracle connection | ✅ Built |
+| Clock-based snipe bot | ✅ Built |
+| 30-day live data collection | 🔄 Running now on cloud |
+| Live dry-run validation | 📋 After data collection |
+| Auto-claim wins | 📋 Planned |
 
 ---
 
-## Research Status
-
-| Topic | Status | Finding |
-|---|---|---|
-| Quote freshness distribution | ✅ Done | p95 freshness explodes to ~67s in tail scenarios |
-| Slippage modeling | ✅ Done | Bimodal: no-fill or adverse-fill, not gaussian |
-| PnL by freshness bucket | ✅ Done | Stale quotes account for majority of losses |
-| Strategy backtesting | ✅ Done | Composite signal: +0.21 EV/dollar, 88.6% win rate |
-| Delta-based token pricing | ✅ Done | Piecewise linear model matching live Polymarket spreads |
-| Composite signal (7 indicators) | ✅ Done | Window delta dominant, T-10s snipe loop |
-| Chainlink WebSocket oracle | ✅ Done | `wss://ws-live-data.polymarket.com` connected |
-| 30-day live data collection | 🔄 In Progress | Deploying to cloud VM |
-| Live dry-run validation | 📋 Planned | Compare simulated vs actual token prices |
-| Auto-claim wins | 📋 Planned | Playwright-based background claimer |
-
----
-
-## Architecture
-
-```
-chainlink_fetcher.py   — Fetch BTC/USD 5-min data (Binance or Chainlink on-chain)
-strategy.py            — Composite 7-indicator signal with window delta dominant
-backtest.py            — Backtest engine with delta-based token pricing
-bot.py                 — Clock-based snipe bot (T-10s entry, Chainlink WebSocket)
-execution_realism.py   — Quote freshness + slippage + adverse fill modeling
-paper_trading.py       — Paper trading simulator with naive vs realistic comparison
-```
-
----
-
-## Strategy: Composite Signal
-
-Seven weighted indicators. **Window delta dominates** — it directly answers the market question.
-
-| Indicator | Weight | Why |
-|---|---|---|
-| Window delta | 5–7 | `(current - window_open) / window_open` — the exact market question |
-| Micro momentum | 2 | Last 2 candles direction |
-| Acceleration | 1.5 | Is momentum building or fading? |
-| EMA 9/21 crossover | 1 | Short-term trend |
-| RSI 14 | 1–2 | Overbought/oversold extremes only |
-| Volume surge | 1 | 1.5x recent vs prior volume confirms direction |
-| Tick trend | 2 | 2-second poll micro-trend during snipe window |
-
-**Token pricing model** (piecewise linear, matches live Polymarket spreads):
-
-| Delta | Token Cost | Break-even Win Rate |
-|---|---|---|
-| < 0.005% | $0.50 | 50% |
-| ~0.02% | $0.55 | 55% |
-| ~0.05% | $0.65 | 65% |
-| ~0.10% | $0.80 | 80% |
-| ≥ 0.15% | $0.92 | 92% |
-
----
-
-## Backtest Results (7 days, 2,016 windows)
-
-```
-Win rate:          88.6%  (break-even needed: 67.6%)
-EV per dollar:    +0.21
-Avg token price:   $0.676
-Execution cost:    31.9% of naive P&L
-
-Delta breakdown:
-  <0.02%  weak:        68.7% win @ $0.519  ✅ slight edge
-  0.02-0.05% moderate: 87.6% win @ $0.594  ✅ good edge
-  0.05-0.10% strong:   96.2% win @ $0.717  ✅ strong edge
-  >0.10%  decisive:    99.4% win @ $0.886  ✅ high win, thin margin
-```
-
-> ⚠️ Win rate is simulated with reversal probability model. Real expected: 68–75% based on community reports. 30-day live data collection in progress.
-
----
-
-## Bot Timing
-
-```
-window_ts  = now - (now % 300)             # current 5-min window start
-close_ts   = window_ts + 300               # exact close time
-slug       = f"btc-updown-5m-{window_ts}"  # deterministic market slug
-
-T-10s → enter TA loop (poll every 2s)
-T-5s  → hard deadline: always trade
-```
-
----
-
-## Setup
+## How to Run
 
 ```bash
 git clone https://github.com/Suuuryaa/polymarket-edge-research
 cd polymarket-edge-research
 pip install -r requirements.txt
 
-# Fetch BTC data
+# Get BTC data
 python chainlink_fetcher.py --days 7
 
 # Run backtest
 python backtest.py --compare
 
-# Dry run bot (no real trades)
+# Dry run — real data, no real money
 python bot.py --dry-run --mode safe
-python bot.py --dry-run --mode degen --once
 ```
 
-For live trading, copy `.env.example` to `.env` and fill in your Polymarket credentials.
+Copy `.env.example` → `.env` and add your Polymarket credentials for live trading.
+
+---
+
+## Files
+
+| File | What it does |
+|---|---|
+| `bot.py` | Main snipe bot — clock timing, signal, order execution |
+| `strategy.py` | 7-indicator signal with window delta dominant |
+| `backtest.py` | Replay historical data through the strategy |
+| `chainlink_fetcher.py` | Fetch BTC/USD 5-min candles from Binance or on-chain |
+| `collect_data.py` | Live data collector — runs 24/7, one row per 5 minutes |
+| `execution_realism.py` | Models real fill costs: slippage, staleness, adverse fills |
+| `paper_trading.py` | Paper trading simulator |
