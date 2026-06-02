@@ -1,316 +1,195 @@
-# Polymarket Trading Agent 🤖📊
+# polymarket-edge-research
 
-An automated trading agent for Polymarket's 5-minute prediction markets. Built with modular architecture for easy strategy customization and robust risk management.
+> **Work in Progress** — Active research into execution realism for Polymarket 5-minute prediction markets.
 
-## 🚀 Features
-
-- **Automated Trading**: Monitors markets and executes trades automatically
-- **Modular Strategy System**: Easy to add custom trading strategies
-- **Risk Management**: Built-in position limits, stop losses, and daily loss caps
-- **Real-time Monitoring**: Continuous market data updates
-- **Testnet Support**: Test strategies without real money
-- **Comprehensive Logging**: Track all trades and decisions
-
-## 📋 Prerequisites
-
-1. **Python 3.9+**
-2. **Polymarket Account** with API access
-3. **Ethereum Wallet** (for transaction signing)
-4. **USDC** for trading (testnet or mainnet)
-
-## 🛠️ Installation
-
-### 1. Clone and Install Dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-### 2. Get Polymarket API Credentials
-
-1. Go to [Polymarket](https://polymarket.com)
-2. Create an account or log in
-3. Navigate to API settings
-4. Generate API key and secret
-5. Save your credentials securely
-
-### 3. Configure the Agent
-
-Edit `polymarket_agent.py` and update the config section:
-
-```python
-config = {
-    'api_key': 'YOUR_API_KEY_HERE',      # Replace with your API key
-    'api_secret': 'YOUR_API_SECRET_HERE', # Replace with your secret
-    'testnet': True,                      # Set False for real trading
-    
-    # ... rest of config
-}
-```
-
-## 🏃 Quick Start
-
-### Test Mode (Recommended First)
-
-```bash
-python polymarket_agent.py
-```
-
-The agent will:
-1. Connect to Polymarket testnet
-2. Monitor 5-minute markets
-3. Generate trading signals
-4. Execute trades (with testnet USDC)
-
-### Production Mode
-
-⚠️ **WARNING**: Only use after thorough testing!
-
-```python
-config = {
-    'testnet': False,  # Enable real trading
-    # ... adjust risk limits
-}
-```
-
-## ⚙️ Configuration Guide
-
-### Strategy Configuration
-
-```python
-'strategy_config': {
-    'momentum_buy_threshold': 0.05,   # Buy when price rises 5%
-    'momentum_sell_threshold': -0.05, # Sell when price falls 5%
-    'min_confidence': 0.6,            # Minimum confidence to trade
-    'base_position_size': 10.0,       # Base position $10
-    'max_position_size': 50.0,        # Max position $50
-}
-```
-
-### Risk Management
-
-```python
-'risk_config': {
-    'max_daily_loss': 100.0,      # Stop trading after $100 daily loss
-    'max_total_exposure': 500.0,  # Max $500 across all positions
-    'max_per_market': 100.0,      # Max $100 in any single market
-    'max_position_size': 50.0,    # Max $50 per trade
-    'stop_loss_pct': 0.20,        # Exit at 20% loss
-}
-```
-
-### Execution Settings
-
-```python
-'update_interval_seconds': 10,  # Check markets every 10 seconds
-```
-
-## 📊 Built-in Strategy: Momentum
-
-The default strategy trades based on price momentum:
-
-**Buy Signal**: Price rises > 5% over recent candles
-- Buys the outcome with increasing confidence
-- Position size scales with momentum strength
-
-**Sell Signal**: Price falls > 5% over recent candles  
-- Sells the outcome before further decline
-- Position size scales with momentum strength
-
-## 🔧 Adding Custom Strategies
-
-Create a new strategy class:
-
-```python
-class MyCustomStrategy(BaseStrategy):
-    def generate_signals(self, markets: List[MarketData]) -> List[TradeSignal]:
-        signals = []
-        
-        for market in markets:
-            # Your strategy logic here
-            # Example: arbitrage, mean reversion, news-based, etc.
-            
-            if should_buy:
-                signal = TradeSignal(
-                    market_id=market.market_id,
-                    outcome="YES",
-                    action=OrderSide.BUY,
-                    confidence=0.8,
-                    size=25.0,
-                    target_price=0.55,
-                    reason="My custom signal",
-                    timestamp=datetime.now()
-                )
-                signals.append(signal)
-        
-        return signals
-```
-
-Then update the config:
-
-```python
-config = {
-    'strategy': 'custom',
-    # ... 
-}
-
-# In __init__:
-if strategy_name == 'custom':
-    self.strategy = MyCustomStrategy(config.get('strategy_config', {}))
-```
-
-## 🎯 Strategy Ideas
-
-Here are some strategies you could implement:
-
-1. **Mean Reversion**: Buy when price overshoots fundamentals
-2. **Arbitrage**: Exploit price differences across markets
-3. **News Trading**: React to external events/catalysts
-4. **Order Book Imbalance**: Trade based on bid/ask pressure
-5. **Volume Analysis**: Follow unusual volume spikes
-6. **Multi-Market Correlation**: Trade based on related market movements
-
-## 📈 Monitoring & Logging
-
-Logs are saved to `polymarket_agent.log`:
-
-```
-2026-04-12 15:30:01 - INFO - Starting Polymarket Trading Agent
-2026-04-12 15:30:02 - INFO - Monitoring 12 markets
-2026-04-12 15:30:05 - INFO - Generated 3 trading signals
-2026-04-12 15:30:06 - INFO - Executing signal: Momentum buy: 6.2% price increase
-2026-04-12 15:30:07 - INFO - Order placed: order_1712934607123
-```
-
-## ⚠️ Important Warnings
-
-### Before Going Live
-
-- [ ] Test extensively on testnet
-- [ ] Start with small position sizes
-- [ ] Monitor for at least 24 hours
-- [ ] Verify API credentials are secure
-- [ ] Understand all risk parameters
-- [ ] Have a kill switch plan
-
-### Risk Considerations
-
-1. **5-minute markets are HIGH FREQUENCY**
-   - Losses can accumulate quickly
-   - Transaction fees matter more
-   - Need fast execution
-
-2. **Market Risks**
-   - Low liquidity = high slippage
-   - Market manipulation possible
-   - Resolution uncertainty
-
-3. **Technical Risks**
-   - API downtime
-   - Network latency
-   - Bugs in strategy code
-
-4. **Regulatory Risks**
-   - Check local gambling/prediction market laws
-   - Understand tax implications
-
-## 🔐 Security Best Practices
-
-1. **Never commit API keys to git**
-2. Use environment variables:
-   ```python
-   import os
-   config = {
-       'api_key': os.getenv('POLYMARKET_API_KEY'),
-       'api_secret': os.getenv('POLYMARKET_API_SECRET'),
-   }
-   ```
-3. Use a dedicated wallet for trading
-4. Enable 2FA on Polymarket account
-5. Monitor logs for suspicious activity
-
-## 📊 Performance Tracking
-
-Add this to track performance:
-
-```python
-# In your trading loop
-total_trades = 0
-winning_trades = 0
-total_pnl = 0.0
-
-# After each trade closes
-total_trades += 1
-if trade_pnl > 0:
-    winning_trades += 1
-total_pnl += trade_pnl
-
-win_rate = winning_trades / total_trades
-print(f"Win Rate: {win_rate:.1%}, Total P&L: ${total_pnl:.2f}")
-```
-
-## 🐛 Troubleshooting
-
-### "Failed to place order"
-- Check API credentials
-- Verify sufficient USDC balance
-- Check network connection
-- Review Polymarket API status
-
-### "Order rejected: Daily loss limit reached"
-- Risk manager stopped trading
-- Check `max_daily_loss` setting
-- Review recent trades in logs
-
-### "No markets found"
-- Verify 5-minute markets are active
-- Check market filtering logic
-- Try adjusting update interval
-
-## 🚧 TODO / Improvements
-
-- [ ] Add actual Polymarket API integration (currently placeholder)
-- [ ] Implement order signing with web3
-- [ ] Add WebSocket support for real-time data
-- [ ] Create backtesting framework
-- [ ] Add Telegram/Discord notifications
-- [ ] Build web dashboard for monitoring
-- [ ] Add more strategies (mean reversion, arbitrage)
-- [ ] Implement order book analysis
-- [ ] Add position management (scaling in/out)
-- [ ] Create database for trade history
-
-## 📚 Resources
-
-- [Polymarket Docs](https://docs.polymarket.com/)
-- [CLOB API Docs](https://docs.polymarket.com/api/clob-api)
-- [py-clob-client](https://github.com/Polymarket/py-clob-client)
-
-## ⚖️ License
-
-MIT License - Use at your own risk
-
-## ⚠️ Disclaimer
-
-**This software is for educational purposes only. Trading prediction markets carries significant risk. You can lose money. The authors are not responsible for any financial losses. Always do your own research and trade responsibly.**
+[![Status](https://img.shields.io/badge/Status-Work%20In%20Progress-yellow?style=flat-square)]()
+[![Python](https://img.shields.io/badge/Python-3.9+-3776AB?style=flat-square&logo=python&logoColor=white)]()
+[![License](https://img.shields.io/badge/License-MIT-22c55e?style=flat-square)]()
 
 ---
 
-## 🤝 Contributing
+## What This Is
 
-Ideas for improvements:
+Most Polymarket bots look profitable in paper trading and bleed money live. This project investigates **why** — and builds the infrastructure to close the gap.
 
-1. Fork the repo
-2. Create a feature branch
-3. Add your strategy/feature
-4. Test thoroughly
-5. Submit a pull request
+The core insight: paper bots assume you fill at mid ± a tick. Real fills are bimodal:
+- **No fill** — you posted a limit order and nobody took the other side
+- **Adverse fill** — you filled exactly when you shouldn't have (the counterparty had fresher data)
 
-## 💬 Questions?
+This repo researches and implements the missing layer: **execution realism**.
 
-- Review the code comments
-- Check Polymarket documentation
-- Test on testnet first
-- Start with small positions
+---
 
-**Happy Trading! 🚀**
+## Research Status
+
+| Topic | Status | Finding |
+|---|---|---|
+| Quote freshness distribution | ✅ Done | p95 freshness explodes to ~67s in tail scenarios |
+| Slippage modeling | ✅ Done | Bimodal: no-fill or adverse-fill, not gaussian |
+| PnL by freshness bucket | ✅ Done | Stale quotes account for majority of losses |
+| Live CLOB integration | 🔄 In Progress | — |
+| Strategy backtesting | 📋 Planned | — |
+| Order book imbalance signals | 📋 Planned | — |
+
+---
+
+## Architecture
+
+```
+polymarket-agent/
+├── execution_realism.py      # Quote freshness + slippage engine  ← core research
+├── paper_trading.py          # Paper trading simulator with realism layer
+├── polymarket_agent.py       # Live agent (CLOB integration)
+├── requirements.txt
+└── README.md
+```
+
+---
+
+## Execution Realism Engine
+
+The key module is `execution_realism.py`. It has three components:
+
+### 1. Quote Freshness Tracker
+
+Tracks how old your quotes are at the moment you act on them. The problem isn't the median — it's the tail.
+
+```
+Median freshness: ~1.5s  (looks fine)
+p95 freshness:    ~67s   (this is where losses live)
+```
+
+Trading on a 67-second-old quote means you're providing liquidity to someone with a 67-second informational advantage.
+
+```python
+tracker = QuoteFreshnessTracker(max_acceptable_age_seconds=5.0)
+fresh, age = tracker.is_fresh(snapshot)
+if not fresh:
+    skip_trade()  # don't fight someone with better data
+```
+
+### 2. Slippage Model
+
+Replaces the naive `mid ± tick` assumption with a realistic bimodal distribution:
+
+| Scenario | Probability | What Happens |
+|---|---|---|
+| No fill (limit orders) | 25% base | Order sits, market moves away |
+| Normal fill | 60% | Base slippage + spread crossing |
+| Adverse fill | 15% base | 3× extra slippage — you filled when you shouldn't have |
+
+Both probabilities scale with quote staleness. A 30-second-old quote has ~15× higher adverse fill risk.
+
+```python
+model = SlippageModel({
+    "no_fill_prob": 0.25,
+    "adverse_fill_prob": 0.15,
+    "adverse_multiplier": 3.0,
+    "taker_fee": 0.002,
+})
+result = model.simulate_fill(quoted_price=0.55, side="BUY", size=10.0, quote_age_seconds=age)
+```
+
+### 3. PnL Bucket Analyser
+
+Buckets closed trades by quote age at fill time and reports PnL concentration:
+
+```
+── PnL by Quote Freshness Bucket ──────────────────────
+  fresh   (0–2s)      | trades= 142 (71.0%) | PnL=$ +48.20 (+22.1%) | win=64.1%
+  ok      (2–5s)      | trades=  38 (19.0%) | PnL=$ +12.10 ( +5.5%) | win=55.3%
+  stale   (5–15s)     | trades=  14 ( 7.0%) | PnL=$ -38.40 (-17.6%) | win=28.6%
+  very_stale (15–60s) | trades=   5 ( 2.5%) | PnL=$ -88.20 (-40.4%) | win=20.0%
+  toxic   (60s+)      | trades=   1 ( 0.5%) | PnL=$ -52.10 (-23.9%) | win= 0.0%
+─────────────────────────────────────────────────────────────────────────────────
+  ⚠️  Stale quotes account for 81.9% of total losses. Consider freshness gating.
+```
+
+If stale quotes (5% of trades) account for 80%+ of losses — that's a **filter problem**, not a strategy problem.
+
+---
+
+## Quick Start
+
+```bash
+git clone https://github.com/Suuuryaa/polymarket-edge-research.git
+cd polymarket-edge-research
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+```
+
+### Run the paper trader (with execution realism)
+
+```bash
+python paper_trading.py
+```
+
+The simulator will show freshness stats, slippage breakdown, and PnL by freshness bucket at the end of each session.
+
+### Run the live agent
+
+```bash
+# Set credentials first
+export POLYMARKET_API_KEY="..."
+export POLYMARKET_API_SECRET="..."
+export POLYMARKET_WALLET_PRIVATE_KEY="..."
+
+python polymarket_agent.py
+```
+
+---
+
+## Configuration
+
+Key parameters in `execution_realism.py` and the agent config:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `max_acceptable_age_seconds` | `5.0` | Gate: refuse to trade on quotes older than this |
+| `no_fill_prob` | `0.25` | Base probability a limit order doesn't fill |
+| `adverse_fill_prob` | `0.15` | Base probability of adverse selection |
+| `adverse_multiplier` | `3.0` | How much worse an adverse fill is vs normal |
+| `taker_fee` | `0.002` | Exchange fee for market orders (0.2%) |
+| `base_slippage` | `0.005` | Normal market-order slippage |
+
+---
+
+## Strategies (Implemented)
+
+| Strategy | Description | Status |
+|---|---|---|
+| Momentum | Trade on price direction over recent candles | ✅ Live |
+| Order Book Imbalance | Buy/sell based on bid-ask pressure | 📋 Planned |
+| Mean Reversion | Fade overshoots from fundamental value | 📋 Planned |
+| Correlation Arb | Exploit mispricing in related markets | 📋 Planned |
+
+---
+
+## Roadmap
+
+- [x] Quote freshness tracking (p50/p95/p99)
+- [x] Bimodal fill simulation
+- [x] PnL bucketing by quote age
+- [ ] Live CLOB order book integration
+- [ ] WebSocket feed for real-time quotes
+- [ ] Backtesting framework against historical fills
+- [ ] Notification system (Telegram/Discord)
+- [ ] Dashboard for live session monitoring
+
+---
+
+## Important Notes
+
+- **Testnet first.** The agent runs against Polymarket testnet by default (`testnet: True`). Don't touch mainnet until you've watched it run for days.
+- **The edge is thin.** Adding 0.01 in slippage kills most strategies. The realism layer exists to find this out before real money does.
+- **This is research, not a product.** Expect rough edges, breaking changes, and honest failure modes.
+
+---
+
+## Disclaimer
+
+This software is for research and educational purposes only. Trading prediction markets carries significant financial risk. You may lose your entire investment. The authors accept no responsibility for financial losses. Do your own research. Trade responsibly.
+
+---
+
+**Built by [Suuuryaa](https://github.com/Suuuryaa)**
