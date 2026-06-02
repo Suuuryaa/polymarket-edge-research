@@ -31,26 +31,30 @@ class PaperTradingSimulator:
     Generates realistic market data for testing
     """
     
-    def __init__(self, config: Dict):
+    def __init__(self, config: Dict, seed: int = None):
         self.config = config
+        self.naive_mode = config.get('naive_mode', False)
         self.logger = logging.getLogger(__name__)
-        
+
+        if seed is not None:
+            random.seed(seed)
+
         # Simulated markets
         self.markets = self._generate_markets()
-        
+
         # Trading state
         self.positions: List[Position] = []
         self.orders: List[Order] = []
         self.balance = config.get('starting_balance', 1000.0)
         self.initial_balance = self.balance
-        
+
         # Performance tracking
         self.total_trades = 0
         self.winning_trades = 0
         self.total_pnl = 0.0
         self.daily_pnl = 0.0
         self.trade_history = []
-        
+
         # Strategy and risk
         self.strategy = MomentumStrategy(config.get('strategy_config', {}))
         self.risk_manager = RiskManager(config.get('risk_config', {}))
@@ -143,7 +147,7 @@ class PaperTradingSimulator:
                 market.last_update = datetime.now()
     
     def _execute_order(self, order: Order) -> bool:
-        """Simulate realistic order execution with freshness gating and slippage"""
+        """Simulate order execution — realistic or naive depending on config"""
 
         # ── Find market ───────────────────────────────────────────────────
         market = next((m for m in self.markets if m.market_id == order.market_id), None)
@@ -151,54 +155,63 @@ class PaperTradingSimulator:
             self.logger.error(f"Market {order.market_id} not found")
             return False
 
-        # ── Quote freshness gate ──────────────────────────────────────────
-        snapshot = QuoteSnapshot(
-            market_id=market.market_id,
-            outcome=order.outcome,
-            price=market.prices[order.outcome],
-            captured_at=market.last_update,    # when the quote was last updated
-        )
-        fresh, age = self.freshness_tracker.is_fresh(snapshot)
-        if not fresh:
-            self.freshness_blocked += 1
-            self.logger.warning(
-                f"🕐 STALE QUOTE BLOCKED: {order.market_id}/{order.outcome} "
-                f"age={age:.1f}s > max={self.freshness_tracker.max_acceptable_age}s"
-            )
-            return False
-
-        # ── Simulate realistic fill ───────────────────────────────────────
-        fill = self.slippage_model.simulate_fill(
-            quoted_price=order.price,
-            side=order.side.value,
-            size=order.size,
-            quote_age_seconds=age,
-            is_market_order=True,
-        )
-
-        if not fill.filled:
-            self.logger.info(
-                f"📭 NO FILL: {order.side.value} {order.market_id}/{order.outcome} "
-                f"@ ${order.price:.3f} (age={age:.1f}s)"
-            )
-            return False
-
-        if fill.reason == "adverse_fill":
-            self.logger.warning(
-                f"⚠️  ADVERSE FILL: {order.side.value} {order.market_id}/{order.outcome} "
-                f"quoted=${order.price:.4f} filled=${fill.fill_price:.4f} "
-                f"slip={fill.slippage_pct*100:+.3f}% age={age:.1f}s"
-            )
+        if self.naive_mode:
+            # ── NAIVE MODE: fill instantly at quoted price, zero fees ─────
+            actual_price = order.price
+            actual_cost  = order.size
+            age          = 0.0
+            fill_reason  = "filled"
+            slip_pct     = 0.0
         else:
-            self.logger.info(
-                f"✅ FILL: {order.side.value} {order.market_id}/{order.outcome} "
-                f"quoted=${order.price:.4f} filled=${fill.fill_price:.4f} "
-                f"slip={fill.slippage_pct*100:+.3f}% age={age:.1f}s"
+            # ── Quote freshness gate ──────────────────────────────────────
+            snapshot = QuoteSnapshot(
+                market_id=market.market_id,
+                outcome=order.outcome,
+                price=market.prices[order.outcome],
+                captured_at=market.last_update,
+            )
+            fresh, age = self.freshness_tracker.is_fresh(snapshot)
+            if not fresh:
+                self.freshness_blocked += 1
+                self.logger.warning(
+                    f"🕐 STALE QUOTE BLOCKED: {order.market_id}/{order.outcome} "
+                    f"age={age:.1f}s > max={self.freshness_tracker.max_acceptable_age}s"
+                )
+                return False
+
+            # ── Simulate realistic fill ───────────────────────────────────
+            fill = self.slippage_model.simulate_fill(
+                quoted_price=order.price,
+                side=order.side.value,
+                size=order.size,
+                quote_age_seconds=age,
+                is_market_order=True,
             )
 
-        # Use the realistic fill price from here on
-        actual_price = fill.fill_price
-        actual_cost  = fill.cost_including_fees
+            if not fill.filled:
+                self.logger.info(
+                    f"📭 NO FILL: {order.side.value} {order.market_id}/{order.outcome} "
+                    f"@ ${order.price:.3f} (age={age:.1f}s)"
+                )
+                return False
+
+            if fill.reason == "adverse_fill":
+                self.logger.warning(
+                    f"⚠️  ADVERSE FILL: {order.side.value} {order.market_id}/{order.outcome} "
+                    f"quoted=${order.price:.4f} filled=${fill.fill_price:.4f} "
+                    f"slip={fill.slippage_pct*100:+.3f}% age={age:.1f}s"
+                )
+            else:
+                self.logger.info(
+                    f"✅ FILL: {order.side.value} {order.market_id}/{order.outcome} "
+                    f"quoted=${order.price:.4f} filled=${fill.fill_price:.4f} "
+                    f"slip={fill.slippage_pct*100:+.3f}% age={age:.1f}s"
+                )
+
+            actual_price = fill.fill_price
+            actual_cost  = fill.cost_including_fees
+            fill_reason  = fill.reason
+            slip_pct     = fill.slippage_pct
 
         # ── Check balance ─────────────────────────────────────────────────
         if order.side == OrderSide.BUY and actual_cost > self.balance:
@@ -268,9 +281,9 @@ class PaperTradingSimulator:
                 'shares':         shares_to_sell,
                 'quoted_price':   order.price,
                 'fill_price':     actual_price,
-                'slippage_pct':   fill.slippage_pct,
+                'slippage_pct':   slip_pct,
                 'quote_age_s':    age,
-                'fill_reason':    fill.reason,
+                'fill_reason':    fill_reason,
                 'pnl':            pnl,
             })
 
@@ -466,43 +479,10 @@ class PaperTradingSimulator:
         print(f"\n💾 Results saved to: {filename}")
 
 
-async def main():
-    """Main entry point for paper trading"""
-
-    parser = argparse.ArgumentParser(description="Polymarket Paper Trading Simulator")
-    parser.add_argument(
-        "--fast", action="store_true",
-        help="Demo mode: 3 simulated minutes, 0.05s tick — completes in ~30s"
-    )
-    parser.add_argument(
-        "--duration", type=int, default=60,
-        help="Simulated duration in minutes (default: 60)"
-    )
-    args = parser.parse_args()
-
-    if args.fast:
-        duration = 3
-        interval = 0.05
-        print("\n" + "="*80)
-        print("🎮 PAPER TRADING SIMULATOR  [FAST / DEMO MODE]")
-        print("="*80)
-        print("Simulating 3 minutes of markets in ~30 seconds")
-        print("Press Ctrl+C to stop early")
-        print("="*80 + "\n")
-    else:
-        duration = args.duration
-        interval = 5
-        print("\n" + "="*80)
-        print("🎮 PAPER TRADING SIMULATOR")
-        print("="*80)
-        print(f"Simulating {duration} minutes  |  tick every {interval}s real time")
-        print("Press Ctrl+C to stop early  |  use --fast for a quick demo")
-        print("="*80 + "\n")
-
-    config = {
+def _base_config(interval: float) -> Dict:
+    return {
         'starting_balance': 1000.0,
         'update_interval_seconds': interval,
-
         'strategy_config': {
             'momentum_buy_threshold': 0.05,
             'momentum_sell_threshold': -0.05,
@@ -510,7 +490,6 @@ async def main():
             'base_position_size': 10.0,
             'max_position_size': 50.0,
         },
-
         'risk_config': {
             'max_daily_loss': 100.0,
             'max_total_exposure': 500.0,
@@ -518,11 +497,7 @@ async def main():
             'max_position_size': 50.0,
             'stop_loss_pct': 0.20,
         },
-
-        'freshness_config': {
-            'max_age_seconds': 5.0,
-        },
-
+        'freshness_config': {'max_age_seconds': 5.0},
         'slippage_config': {
             'base_slippage':      0.005,
             'spread_half':        0.003,
@@ -534,13 +509,119 @@ async def main():
         },
     }
 
+
+def _print_comparison(naive_sim: 'PaperTradingSimulator', real_sim: 'PaperTradingSimulator'):
+    """Side-by-side comparison: naive paper trading vs execution realism"""
+
+    def total_value(sim):
+        v = sim.balance
+        for p in sim.positions:
+            v += p.shares * p.current_price
+        return v
+
+    n_val  = total_value(naive_sim)
+    r_val  = total_value(real_sim)
+    n_pnl  = n_val - naive_sim.initial_balance
+    r_pnl  = r_val - real_sim.initial_balance
+    gap    = r_pnl - n_pnl
+
+    ns = real_sim.slippage_model.stats()
+    nf = real_sim.freshness_tracker.stats()
+
+    print("\n")
+    print("╔" + "═"*78 + "╗")
+    print("║  NAIVE PAPER TRADING  vs  EXECUTION REALISM — SIDE BY SIDE" + " "*18 + "║")
+    print("╠" + "═"*78 + "╣")
+    print(f"║  {'Metric':<32} {'Naive (paper bot)':>18}  {'Realistic':>18}  ║")
+    print("╠" + "═"*78 + "╣")
+
+    rows = [
+        ("Final balance",      f"${n_val:>10.2f}",       f"${r_val:>10.2f}"),
+        ("Total P&L",          f"${n_pnl:>+10.2f}",      f"${r_pnl:>+10.2f}"),
+        ("P&L %",              f"{n_pnl/naive_sim.initial_balance*100:>+9.2f}%",
+                               f"{r_pnl/real_sim.initial_balance*100:>+9.2f}%"),
+        ("Trades closed",      f"{naive_sim.total_trades:>18}",  f"{real_sim.total_trades:>18}"),
+        ("Win rate",           f"{naive_sim.winning_trades/max(naive_sim.total_trades,1)*100:>18.1f}%",
+                               f"{real_sim.winning_trades/max(real_sim.total_trades,1)*100:>18.1f}%"),
+        ("Avg P&L per trade",  f"${naive_sim.total_pnl/max(naive_sim.total_trades,1):>+9.2f}",
+                               f"${real_sim.total_pnl/max(real_sim.total_trades,1):>+9.2f}"),
+        ("Stale quotes blocked", "             0",
+                               f"{nf.get('stale_blocks',0):>18}"),
+        ("Adverse fills",      "             0",
+                               f"{ns.get('adverse_fills',0):>18}"),
+        ("Avg slippage",       "         0.000%",
+                               f"{ns.get('avg_slippage_pct',0):>17.3f}%"),
+        ("p95 slippage",       "         0.000%",
+                               f"{ns.get('p95_slippage_pct',0):>17.3f}%"),
+    ]
+
+    for label, naive_val, real_val in rows:
+        print(f"║  {label:<32} {naive_val:>18}  {real_val:>18}  ║")
+
+    print("╠" + "═"*78 + "╣")
+    print(f"║  {'EXECUTION COST (gap)':<32} {' ':>18}  {gap:>+17.2f}  ║")
+    pct_of_naive = (gap / abs(n_pnl) * 100) if n_pnl != 0 else 0
+    print(f"║  {'  as % of naive P&L':<32} {' ':>18}  {pct_of_naive:>+16.1f}%  ║")
+    print("╚" + "═"*78 + "╝")
+
+    print("\n  ↑ The execution cost is the hidden drag that paper bots never see.")
+    print("  ↑ If naive P&L is positive but realistic is negative: strategy has NO edge.")
+    print()
+
+    print(real_sim.bucket_analyser.report())
+
+
+async def main():
+    """Main entry point for paper trading"""
+
+    parser = argparse.ArgumentParser(description="Polymarket Paper Trading Simulator")
+    parser.add_argument("--fast",    action="store_true", help="Demo mode (~30s runtime)")
+    parser.add_argument("--naive",   action="store_true", help="Run naive mode only (no realism)")
+    parser.add_argument("--compare", action="store_true", help="Run both modes and show side-by-side")
+    parser.add_argument("--duration", type=int, default=60, help="Duration in minutes (default: 60)")
+    args = parser.parse_args()
+
+    duration = 3   if args.fast else args.duration
+    interval = 0.05 if args.fast else 5.0
+
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.WARNING,   # quieter in compare mode so table stands out
         format='%(asctime)s - %(levelname)s - %(message)s'
     )
 
-    simulator = PaperTradingSimulator(config)
-    await simulator.run_simulation(duration_minutes=duration)
+    if args.compare:
+        seed = random.randint(0, 999999)
+        print("\n" + "="*80)
+        print("🔬 STRATEGY DIAGNOSTICS — NAIVE vs REALISTIC  (seed={})".format(seed))
+        print("="*80)
+        print(f"Running {duration}-minute sim twice with identical market data...")
+        print("Ctrl+C to abort\n")
+
+        naive_cfg = {**_base_config(interval), 'naive_mode': True}
+        real_cfg  = {**_base_config(interval), 'naive_mode': False}
+
+        print("  [1/2] Running naive simulation...")
+        naive_sim = PaperTradingSimulator(naive_cfg, seed=seed)
+        await naive_sim.run_simulation(duration_minutes=duration)
+
+        print("  [2/2] Running realistic simulation (same seed)...")
+        real_sim = PaperTradingSimulator(real_cfg, seed=seed)
+        await real_sim.run_simulation(duration_minutes=duration)
+
+        _print_comparison(naive_sim, real_sim)
+
+    else:
+        mode_label = "NAIVE" if args.naive else ("FAST / DEMO" if args.fast else "REALISTIC")
+        print("\n" + "="*80)
+        print(f"🎮 PAPER TRADING SIMULATOR  [{mode_label}]")
+        print("="*80)
+        print(f"Simulating {duration} minutes  |  use --compare to see naive vs realistic gap")
+        print("="*80 + "\n")
+
+        logging.getLogger().setLevel(logging.INFO)
+        cfg = {**_base_config(interval), 'naive_mode': args.naive}
+        sim = PaperTradingSimulator(cfg)
+        await sim.run_simulation(duration_minutes=duration)
 
 
 if __name__ == "__main__":
