@@ -1,26 +1,31 @@
 """
 Backtest Engine — Chainlink BTC/USD 5-Min Markets
 ===================================================
-Replays real Chainlink BTC/USD windows through the strategy + execution
-realism layer. Shows what a strategy ACTUALLY would have made vs what a
-naive paper bot would have reported.
+Replays real 5-min windows through the composite strategy with:
+  - Window delta dominant signal (weight 5–7)
+  - Delta-based token pricing (not fixed $0.50 — reflects real market cost)
+  - Realistic fill simulation (slippage, staleness, adverse fills)
+
+The pricing model is critical: at T-10s, tokens cost $0.70–0.95 when the
+direction is clear. A fixed $0.50 backtest is misleading.
 
 Usage:
     python backtest.py --data data/btc_usd_chainlink.csv
-    python backtest.py --data data/btc_usd_chainlink.csv --naive
     python backtest.py --data data/btc_usd_chainlink.csv --compare
+    python backtest.py --data data/btc_usd_chainlink.csv --min-conf 0.4
 """
 
 import argparse
 import csv
 import random
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
 import numpy as np
 
+from strategy import Signal, analyze, Candle, token_price_from_delta, min_win_rate_needed, expected_value
 from execution_realism import SlippageModel, QuoteFreshnessTracker, FreshnessBucketAnalyser, QuoteSnapshot
 
 
@@ -29,9 +34,10 @@ from execution_realism import SlippageModel, QuoteFreshnessTracker, FreshnessBuc
 @dataclass
 class Window:
     window_start: datetime
+    window_end:   datetime
     open_price:   float
     close_price:  float
-    pct_change:   float    # % move in 5-min window
+    pct_change:   float
     outcome:      str      # "UP" or "DOWN"
     rounds_used:  int
 
@@ -43,6 +49,7 @@ def load_windows(path: str) -> List[Window]:
         for row in reader:
             windows.append(Window(
                 window_start = datetime.fromisoformat(row["window_start_utc"]),
+                window_end   = datetime.fromisoformat(row["window_end_utc"]),
                 open_price   = float(row["open_price_usd"]),
                 close_price  = float(row["close_price_usd"]),
                 pct_change   = float(row["pct_change"]),
@@ -52,187 +59,143 @@ def load_windows(path: str) -> List[Window]:
     return windows
 
 
-# ── Prediction market price model ─────────────────────────────────────────────
-
-def estimate_market_price(
-    window: Window,
-    lookahead_windows: List[Window],
-    history_windows: List[Window],
-) -> Dict[str, float]:
-    """
-    Estimate what the Polymarket YES/NO prices would be just before resolution.
-
-    In a perfectly efficient market, YES price = P(BTC goes UP in 5 min).
-    We estimate this from recent momentum:
-      - Base rate: ~50% (BTC is roughly 50/50 short term)
-      - Adjusted by recent momentum signal
-    """
-    # Base probability from last 20 windows
-    recent = history_windows[-20:] if len(history_windows) >= 20 else history_windows
-    if not recent:
-        up_prob = 0.50
-    else:
-        up_count = sum(1 for w in recent if w.outcome == "UP")
-        up_prob  = up_count / len(recent)
-        # Momentum: last 3 windows all same direction → slight edge
-        last3 = recent[-3:]
-        if len(last3) == 3 and all(w.outcome == "UP" for w in last3):
-            up_prob = min(0.65, up_prob + 0.05)
-        elif len(last3) == 3 and all(w.outcome == "DOWN" for w in last3):
-            up_prob = max(0.35, up_prob - 0.05)
-
-    yes_price = round(max(0.05, min(0.95, up_prob)), 3)
-    no_price  = round(1.0 - yes_price, 3)
-    return {"YES": yes_price, "NO": no_price}
+def windows_to_candles(history: List[Window]) -> List[Candle]:
+    """Convert Window history to Candle list for strategy.analyze()."""
+    return [
+        Candle(
+            open=w.open_price, high=max(w.open_price, w.close_price),
+            low=min(w.open_price, w.close_price), close=w.close_price,
+            volume=1.0,
+        )
+        for w in history
+    ]
 
 
-# ── Strategy ──────────────────────────────────────────────────────────────────
+# ── Snipe signal (T-10s simulation) ──────────────────────────────────────────
 
-@dataclass
-class Signal:
-    side:       str      # "BUY_YES", "BUY_NO"
-    price:      float
-    confidence: float
-    reason:     str
-
-
-def momentum_signal(
+def snipe_signal(
     window: Window,
     history: List[Window],
-    buy_threshold: float = 0.05,
-    min_confidence: float = 0.55,
+    min_confidence: float = 0.30,
 ) -> Optional[Signal]:
     """
-    Momentum signal based on recent 5-min windows.
-    If last 3 windows are all UP → buy YES
-    If last 3 windows are all DOWN → buy NO
+    Simulate T-10s snipe: we know the window open price and the price now
+    (10s before close = close_price with small random noise to simulate
+    the real BTC price at T-10s, not exactly at close).
     """
-    if len(history) < 3:
-        return None
+    # At T-10s, price has moved ~80% of its final distance.
+    # Simulate: T-10 price = open + 0.85 * (close - open) + noise
+    close = window.close_price
+    open_ = window.open_price
+    noise = random.gauss(0, abs(close - open_) * 0.05 + open_ * 0.00005)
+    price_at_t10 = open_ + 0.85 * (close - open_) + noise
 
-    last3     = history[-3:]
-    prices    = [w.pct_change for w in last3]
-    avg_move  = sum(prices) / len(prices)
-    all_up    = all(w.outcome == "UP"   for w in last3)
-    all_down  = all(w.outcome == "DOWN" for w in last3)
+    candles = windows_to_candles(history[-21:]) if history else []
+    # Simulate tick prices (3 ticks: T-20, T-15, T-10)
+    tick_prices = [
+        open_ + 0.60 * (close - open_),
+        open_ + 0.75 * (close - open_),
+        price_at_t10,
+    ]
 
-    market_prices = estimate_market_price(window, [], history)
-
-    if all_up and avg_move > buy_threshold / 10:
-        confidence = min(0.80, 0.50 + abs(avg_move) * 20)
-        if confidence >= min_confidence:
-            return Signal(
-                side="BUY_YES",
-                price=market_prices["YES"],
-                confidence=confidence,
-                reason=f"3× UP streak, avg move={avg_move:+.4f}%",
-            )
-
-    elif all_down and avg_move < -buy_threshold / 10:
-        confidence = min(0.80, 0.50 + abs(avg_move) * 20)
-        if confidence >= min_confidence:
-            return Signal(
-                side="BUY_NO",
-                price=market_prices["NO"],
-                confidence=confidence,
-                reason=f"3× DOWN streak, avg move={avg_move:+.4f}%",
-            )
-
-    return None
+    return analyze(
+        window_open_price = open_,
+        current_price     = price_at_t10,
+        candles_1m        = candles,
+        tick_prices       = tick_prices,
+        min_confidence    = min_confidence,
+    )
 
 
 # ── Trade result ──────────────────────────────────────────────────────────────
 
 @dataclass
 class TradeResult:
-    window_start:  datetime
-    signal_side:   str
-    quoted_price:  float
-    fill_price:    float
-    outcome:       str       # actual Chainlink outcome
-    won:           bool
-    pnl:           float
-    fill_reason:   str
-    quote_age_s:   float
-    slippage_pct:  float
-    position_size: float
+    window_start:    datetime
+    signal_side:     str
+    window_delta_pct: float
+    token_price:     float
+    fill_price:      float
+    outcome:         str
+    won:             bool
+    pnl:             float
+    fill_reason:     str
+    quote_age_s:     float
+    slippage_pct:    float
+    confidence:      float
+    position_size:   float
+
+
+# ── Backtest config ───────────────────────────────────────────────────────────
+
+@dataclass
+class BacktestConfig:
+    starting_balance: float = 1000.0
+    position_size:    float = 20.0
+    max_exposure:     float = 200.0
+    naive_mode:       bool  = False
+    max_quote_age_s:  float = 3.0
+    min_confidence:   float = 0.30
+    seed:             int   = 42
 
 
 # ── Backtest runner ───────────────────────────────────────────────────────────
 
-@dataclass
-class BacktestConfig:
-    starting_balance:  float = 1000.0
-    position_size:     float = 20.0      # $ per trade
-    max_exposure:      float = 200.0     # max $ at risk at once
-    naive_mode:        bool  = False
-    max_quote_age_s:   float = 3.0       # freshness gate
-    seed:              int   = 42
-
-
 def run_backtest(windows: List[Window], cfg: BacktestConfig) -> Tuple[List[TradeResult], Dict]:
     random.seed(cfg.seed)
 
-    slippage_model   = SlippageModel() if not cfg.naive_mode else None
+    slippage_model    = SlippageModel() if not cfg.naive_mode else None
     freshness_tracker = QuoteFreshnessTracker(cfg.max_quote_age_s) if not cfg.naive_mode else None
-    bucket_analyser  = FreshnessBucketAnalyser()
+    bucket_analyser   = FreshnessBucketAnalyser()
 
-    balance      = cfg.starting_balance
-    trades       = []
-    history      = []
+    balance = cfg.starting_balance
+    trades  = []
+    history: List[Window] = []
 
     for i, window in enumerate(windows):
         history.append(window)
 
-        signal = momentum_signal(window, history[:-1])
+        signal = snipe_signal(window, history[:-1], cfg.min_confidence)
         if not signal:
             continue
 
+        # Delta-based token pricing (not fixed $0.50)
+        quoted_price = signal.token_price
+
         if cfg.naive_mode:
-            # Naive: always fills at quoted price, zero fees, no staleness
-            fill_price   = signal.price
-            fill_reason  = "filled"
-            quote_age    = 0.0
-            slip_pct     = 0.0
-            filled       = True
+            fill_price  = quoted_price
+            fill_reason = "filled"
+            quote_age   = 0.0
+            slip_pct    = 0.0
+            filled      = True
         else:
-            # Realistic: quote age simulated, staleness gate, slippage model
-            # Simulate quote age: mostly fresh, occasionally stale
+            # Simulate quote age distribution (matches execution_realism model)
             r = random.random()
             if r < 0.05:
-                quote_age = random.uniform(20, 90)   # p5 tail — toxic
+                quote_age = random.uniform(20, 90)
             elif r < 0.20:
-                quote_age = random.uniform(5, 20)    # moderate delay
+                quote_age = random.uniform(5, 20)
             else:
-                quote_age = random.uniform(0, 2)     # fresh
+                quote_age = random.uniform(0, 2)
 
             snapshot = QuoteSnapshot(
                 market_id   = f"window_{i}",
                 outcome     = "YES",
-                price       = signal.price,
-                captured_at = datetime.now(tz=timezone.utc),
-            )
-            # Manually set age for simulation (override captured_at effect)
-            from datetime import timedelta
-            snapshot = QuoteSnapshot(
-                market_id   = f"window_{i}",
-                outcome     = "YES",
-                price       = signal.price,
-                captured_at = datetime.now(tz=timezone.utc).__class__.now(tz=timezone.utc) - timedelta(seconds=quote_age),
+                price       = quoted_price,
+                captured_at = datetime.now(tz=timezone.utc) - timedelta(seconds=quote_age),
             )
 
             fresh, age = freshness_tracker.is_fresh(snapshot)
             quote_age  = age
-
             if not fresh:
-                continue   # blocked by freshness gate
+                continue
 
             fill = slippage_model.simulate_fill(
-                quoted_price    = signal.price,
-                side            = "BUY",
-                size            = cfg.position_size,
+                quoted_price      = quoted_price,
+                side              = "BUY",
+                size              = cfg.position_size,
                 quote_age_seconds = quote_age,
-                is_market_order = True,
+                is_market_order   = True,
             )
             fill_price  = fill.fill_price
             fill_reason = fill.reason
@@ -242,13 +205,10 @@ def run_backtest(windows: List[Window], cfg: BacktestConfig) -> Tuple[List[Trade
             if not filled:
                 continue
 
-        # Determine if trade won
-        # BUY_YES wins if outcome is UP; BUY_NO wins if outcome is DOWN
         won = (signal.side == "BUY_YES" and window.outcome == "UP") or \
               (signal.side == "BUY_NO"  and window.outcome == "DOWN")
 
-        # P&L: binary market — if win, profit = (1 - fill_price) * size
-        #                       if lose, loss  = fill_price * size
+        # Binary market P&L
         if won:
             pnl = (1.0 - fill_price) * cfg.position_size
         else:
@@ -258,121 +218,141 @@ def run_backtest(windows: List[Window], cfg: BacktestConfig) -> Tuple[List[Trade
         bucket_analyser.record_trade(quote_age if not cfg.naive_mode else 0.0, pnl)
 
         trades.append(TradeResult(
-            window_start  = window.window_start,
-            signal_side   = signal.side,
-            quoted_price  = signal.price,
-            fill_price    = fill_price,
-            outcome       = window.outcome,
-            won           = won,
-            pnl           = pnl,
-            fill_reason   = fill_reason,
-            quote_age_s   = quote_age if not cfg.naive_mode else 0.0,
-            slippage_pct  = slip_pct,
-            position_size = cfg.position_size,
+            window_start     = window.window_start,
+            signal_side      = signal.side,
+            window_delta_pct = signal.window_delta_pct,
+            token_price      = quoted_price,
+            fill_price       = fill_price,
+            outcome          = window.outcome,
+            won              = won,
+            pnl              = pnl,
+            fill_reason      = fill_reason,
+            quote_age_s      = quote_age if not cfg.naive_mode else 0.0,
+            slippage_pct     = slip_pct,
+            confidence       = signal.confidence,
+            position_size    = cfg.position_size,
         ))
 
-    # Summary stats
-    total_pnl    = sum(t.pnl for t in trades)
-    win_rate     = sum(1 for t in trades if t.won) / len(trades) if trades else 0
-    adverse      = sum(1 for t in trades if t.fill_reason == "adverse_fill")
-    avg_slip     = np.mean([t.slippage_pct for t in trades]) * 100 if trades else 0
-    p95_slip     = float(np.percentile([t.slippage_pct for t in trades], 95)) * 100 if trades else 0
+    total_pnl = sum(t.pnl for t in trades)
+    win_rate  = sum(1 for t in trades if t.won) / len(trades) if trades else 0
+    adverse   = sum(1 for t in trades if t.fill_reason == "adverse_fill")
+    avg_slip  = float(np.mean([t.slippage_pct for t in trades]) * 100) if trades else 0
+    p95_slip  = float(np.percentile([t.slippage_pct for t in trades], 95) * 100) if trades else 0
+    avg_token = float(np.mean([t.token_price for t in trades])) if trades else 0
+    avg_conf  = float(np.mean([t.confidence for t in trades])) if trades else 0
     freshness_stats = freshness_tracker.stats() if freshness_tracker else {}
 
+    # Delta bucket breakdown
+    delta_buckets: Dict[str, Dict] = {}
+    for t in trades:
+        ad = abs(t.window_delta_pct)
+        if ad >= 0.10:
+            bucket = ">0.10% (decisive)"
+        elif ad >= 0.05:
+            bucket = "0.05-0.10% (strong)"
+        elif ad >= 0.02:
+            bucket = "0.02-0.05% (moderate)"
+        else:
+            bucket = "<0.02% (weak)"
+        b = delta_buckets.setdefault(bucket, {"trades": 0, "wins": 0, "pnl": 0.0, "avg_price": []})
+        b["trades"] += 1
+        b["wins"]   += 1 if t.won else 0
+        b["pnl"]    += t.pnl
+        b["avg_price"].append(t.token_price)
+
     summary = {
-        "starting_balance":  cfg.starting_balance,
-        "final_balance":     balance,
-        "total_pnl":         total_pnl,
-        "total_trades":      len(trades),
-        "win_rate":          win_rate,
-        "adverse_fills":     adverse,
-        "avg_slippage_pct":  avg_slip,
-        "p95_slippage_pct":  p95_slip,
-        "stale_blocks":      freshness_stats.get("stale_blocks", 0),
-        "bucket_report":     bucket_analyser.report(),
+        "starting_balance": cfg.starting_balance,
+        "final_balance":    balance,
+        "total_pnl":        total_pnl,
+        "total_trades":     len(trades),
+        "win_rate":         win_rate,
+        "adverse_fills":    adverse,
+        "avg_slippage_pct": avg_slip,
+        "p95_slippage_pct": p95_slip,
+        "avg_token_price":  avg_token,
+        "avg_confidence":   avg_conf,
+        "stale_blocks":     freshness_stats.get("stale_blocks", 0),
+        "bucket_report":    bucket_analyser.report(),
+        "delta_buckets":    delta_buckets,
     }
     return trades, summary
 
 
-# ── Comparison printer ────────────────────────────────────────────────────────
+# ── Printers ──────────────────────────────────────────────────────────────────
 
-def print_comparison(naive_summary: Dict, real_summary: Dict, windows: List[Window]):
+def print_delta_breakdown(summary: Dict):
+    print("\n── Delta Bucket Breakdown ───────────────────────────────────────────")
+    print(f"  {'Bucket':<24} {'Trades':>6}  {'Win%':>6}  {'Avg Token':>10}  {'PnL':>9}  {'Min WR':>7}")
+    print("  " + "-"*70)
+    for bucket, b in sorted(summary["delta_buckets"].items()):
+        wr    = b["wins"] / b["trades"] * 100 if b["trades"] else 0
+        avg_p = sum(b["avg_price"]) / len(b["avg_price"]) if b["avg_price"] else 0
+        needed = min_win_rate_needed(avg_p) * 100
+        ev    = expected_value(avg_p, b["wins"] / b["trades"] if b["trades"] else 0)
+        flag  = "✅" if ev > 0 else "❌"
+        print(f"  {bucket:<24} {b['trades']:>6}  {wr:>5.1f}%  ${avg_p:>8.3f}  {b['pnl']:>+8.2f}  {needed:>6.1f}% {flag}")
+    print()
+
+
+def print_comparison(naive_summary: Dict, real_summary: Dict, windows: List[Window], min_conf: float):
     n = naive_summary
     r = real_summary
     gap = r["total_pnl"] - n["total_pnl"]
-
     up_pct = sum(1 for w in windows if w.outcome == "UP") / len(windows) * 100
 
+    W = 78
+    def row(label, nv, rv):
+        print(f"║  {label:<36} {nv:>16}  {rv:>16}  ║")
+
     print("\n")
-    print("╔" + "═"*76 + "╗")
-    print("║  BACKTEST: REAL CHAINLINK BTC/USD DATA — NAIVE vs REALISTIC" + " "*16 + "║")
-    print("╠" + "═"*76 + "╣")
-    print(f"║  Windows: {len(windows):,}  |  Date range: {windows[0].window_start.date()} → {windows[-1].window_start.date()}" + " "*20 + "║")
-    print(f"║  BTC UP%: {up_pct:.1f}%  (base rate — random guessing wins {up_pct:.1f}% of the time)" + " "*5 + "║")
-    print("╠" + "═"*76 + "╣")
-    print(f"║  {'Metric':<34} {'Naive':>16}  {'Realistic':>16}  ║")
-    print("╠" + "═"*76 + "╣")
-
-    rows = [
-        ("Final balance",       f"${n['final_balance']:>12.2f}",    f"${r['final_balance']:>12.2f}"),
-        ("Total P&L",           f"${n['total_pnl']:>+12.2f}",       f"${r['total_pnl']:>+12.2f}"),
-        ("P&L %",               f"{n['total_pnl']/n['starting_balance']*100:>+11.2f}%",
-                                f"{r['total_pnl']/r['starting_balance']*100:>+11.2f}%"),
-        ("Trades taken",        f"{n['total_trades']:>16}",          f"{r['total_trades']:>16}"),
-        ("Win rate",            f"{n['win_rate']*100:>15.1f}%",      f"{r['win_rate']*100:>15.1f}%"),
-        ("Stale quotes blocked",f"{'0':>16}",                        f"{r['stale_blocks']:>16}"),
-        ("Adverse fills",       f"{'0':>16}",                        f"{r['adverse_fills']:>16}"),
-        ("Avg slippage",        f"{'0.000%':>16}",                   f"{r['avg_slippage_pct']:>15.3f}%"),
-        ("p95 slippage",        f"{'0.000%':>16}",                   f"{r['p95_slippage_pct']:>15.3f}%"),
-    ]
-
-    for label, nv, rv in rows:
-        print(f"║  {label:<34} {nv:>16}  {rv:>16}  ║")
-
-    print("╠" + "═"*76 + "╣")
+    print("╔" + "═"*W + "╗")
+    print("║  BACKTEST: REAL CHAINLINK BTC/USD — NAIVE vs REALISTIC (DELTA PRICING)" + " "*(W-72) + "║")
+    print("╠" + "═"*W + "╣")
+    print(f"║  Windows: {len(windows):,}  |  {windows[0].window_start.date()} → {windows[-1].window_start.date()}  |  min_conf={min_conf:.0%}  |  BTC UP%={up_pct:.1f}%" + " "*(W-72) + "║")
+    print("╠" + "═"*W + "╣")
+    print(f"║  {'Metric':<36} {'Naive':>16}  {'Realistic':>16}  ║")
+    print("╠" + "═"*W + "╣")
+    row("Final balance",        f"${n['final_balance']:>12.2f}", f"${r['final_balance']:>12.2f}")
+    row("Total P&L",            f"${n['total_pnl']:>+12.2f}",   f"${r['total_pnl']:>+12.2f}")
+    row("P&L %",                f"{n['total_pnl']/n['starting_balance']*100:>+11.2f}%",
+                                f"{r['total_pnl']/r['starting_balance']*100:>+11.2f}%")
+    row("Trades taken",         f"{n['total_trades']:>16}",      f"{r['total_trades']:>16}")
+    row("Win rate",             f"{n['win_rate']*100:>15.1f}%",  f"{r['win_rate']*100:>15.1f}%")
+    row("Avg token price",      f"${n['avg_token_price']:>11.3f}",f"${r['avg_token_price']:>11.3f}")
+    row("Min WR needed (avg)",  f"{n['avg_token_price']*100:>15.1f}%",f"{r['avg_token_price']*100:>15.1f}%")
+    row("Avg confidence",       f"{n['avg_confidence']*100:>15.1f}%",f"{r['avg_confidence']*100:>15.1f}%")
+    row("Stale quotes blocked", f"{'0':>16}",                    f"{r['stale_blocks']:>16}")
+    row("Adverse fills",        f"{'0':>16}",                    f"{r['adverse_fills']:>16}")
+    row("Avg slippage",         f"{'0.000%':>16}",               f"{r['avg_slippage_pct']:>15.3f}%")
+    print("╠" + "═"*W + "╣")
     pct_of_naive = (gap / abs(n["total_pnl"]) * 100) if n["total_pnl"] != 0 else 0
-    print(f"║  {'EXECUTION COST (gap)':<34} {'':>16}  {gap:>+15.2f}  ║")
-    print(f"║  {'  as % of naive P&L':<34} {'':>16}  {pct_of_naive:>+14.1f}%  ║")
-    print("╚" + "═"*76 + "╝")
+    print(f"║  {'EXECUTION COST (gap)':<36} {'':>16}  {gap:>+15.2f}  ║")
+    print(f"║  {'  as % of naive P&L':<36} {'':>16}  {pct_of_naive:>+13.1f}%  ║")
+    print("╚" + "═"*W + "╝")
 
-    has_edge = n["win_rate"] > 0.52
-    print(f"\n  Strategy verdict: ", end="")
-    if has_edge and r["total_pnl"] > 0:
-        print("✅ Edge survives execution costs — strategy is viable")
-    elif has_edge and r["total_pnl"] <= 0:
-        print("⚠️  Naive edge exists but execution costs kill it — needs improvement")
+    # Verdict
+    ev = expected_value(n["avg_token_price"], n["win_rate"])
+    print(f"\n  Strategy verdict (naive): ", end="")
+    if ev > 0:
+        print(f"✅ Positive EV = {ev:+.4f} per $ risked")
     else:
-        print("❌ No edge — win rate too close to base rate (50%)")
+        print(f"❌ Negative EV = {ev:+.4f} per $ risked")
+        print(f"     Win rate {n['win_rate']*100:.1f}% < token cost {n['avg_token_price']*100:.1f}% break-even")
 
-    print(r["bucket_report"])
-
-
-def print_single(summary: Dict, mode: str, windows: List[Window]):
-    s = summary
-    print(f"\n{'='*60}")
-    print(f"  BACKTEST RESULTS — {mode.upper()}")
-    print(f"  {len(windows):,} real Chainlink 5-min windows")
-    print(f"{'='*60}")
-    print(f"  Final balance:   ${s['final_balance']:.2f}")
-    print(f"  Total P&L:       ${s['total_pnl']:+.2f} ({s['total_pnl']/s['starting_balance']*100:+.2f}%)")
-    print(f"  Trades:          {s['total_trades']}")
-    print(f"  Win rate:        {s['win_rate']*100:.1f}%")
-    if mode == "realistic":
-        print(f"  Stale blocks:    {s['stale_blocks']}")
-        print(f"  Adverse fills:   {s['adverse_fills']}")
-        print(f"  Avg slippage:    {s['avg_slippage_pct']:.3f}%")
-    print(s["bucket_report"])
+    print_delta_breakdown(n)
+    print(n["bucket_report"])
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="Backtest on real Chainlink BTC/USD data")
-    parser.add_argument("--data",    default="data/btc_usd_chainlink.csv", help="Path to windows CSV")
-    parser.add_argument("--naive",   action="store_true",  help="Run naive mode only")
-    parser.add_argument("--compare", action="store_true",  help="Side-by-side comparison (default)")
-    parser.add_argument("--size",    type=float, default=20.0, help="Position size $ (default: 20)")
-    parser.add_argument("--balance", type=float, default=1000.0, help="Starting balance (default: 1000)")
+    parser.add_argument("--data",     default="data/btc_usd_chainlink.csv")
+    parser.add_argument("--compare",  action="store_true", help="Naive vs realistic side-by-side")
+    parser.add_argument("--naive",    action="store_true", help="Naive mode only")
+    parser.add_argument("--size",     type=float, default=20.0)
+    parser.add_argument("--balance",  type=float, default=1000.0)
+    parser.add_argument("--min-conf", type=float, default=0.30, help="Min confidence to trade (default: 0.30)")
     args = parser.parse_args()
 
     data_path = Path(args.data)
@@ -385,27 +365,25 @@ def main():
     windows = load_windows(str(data_path))
     print(f"  Loaded {len(windows):,} windows")
 
-    cfg_base = BacktestConfig(
-        starting_balance = args.balance,
-        position_size    = args.size,
-    )
+    cfg_base = {
+        "starting_balance": args.balance,
+        "position_size":    args.size,
+        "min_confidence":   args.min_conf,
+    }
 
     if args.naive:
-        cfg = BacktestConfig(**{**cfg_base.__dict__, "naive_mode": True})
+        cfg = BacktestConfig(**cfg_base, naive_mode=True)
         _, summary = run_backtest(windows, cfg)
-        print_single(summary, "naive", windows)
-
+        print_delta_breakdown(summary)
+        print(summary["bucket_report"])
     else:
-        # Default: compare mode
         print("  Running naive backtest...")
-        cfg_naive = BacktestConfig(**{**cfg_base.__dict__, "naive_mode": True,  "seed": 42})
-        _, naive_summary = run_backtest(windows, cfg_naive)
+        _, naive_summary = run_backtest(windows, BacktestConfig(**cfg_base, naive_mode=True, seed=42))
 
-        print("  Running realistic backtest (same seed)...")
-        cfg_real = BacktestConfig(**{**cfg_base.__dict__, "naive_mode": False, "seed": 42})
-        _, real_summary = run_backtest(windows, cfg_real)
+        print("  Running realistic backtest...")
+        _, real_summary  = run_backtest(windows, BacktestConfig(**cfg_base, naive_mode=False, seed=42))
 
-        print_comparison(naive_summary, real_summary, windows)
+        print_comparison(naive_summary, real_summary, windows, args.min_conf)
 
 
 if __name__ == "__main__":
