@@ -5,6 +5,7 @@ Simulates market data and trading without needing real API access.
 Perfect for learning and testing strategies.
 """
 
+import argparse
 import asyncio
 import random
 import logging
@@ -430,7 +431,7 @@ class PaperTradingSimulator:
     
     def _export_results(self):
         """Export simulation results to JSON"""
-        
+
         results = {
             'start_time': datetime.now().isoformat(),
             'initial_balance': self.initial_balance,
@@ -439,33 +440,69 @@ class PaperTradingSimulator:
             'total_trades': self.total_trades,
             'winning_trades': self.winning_trades,
             'win_rate': (self.winning_trades / self.total_trades * 100) if self.total_trades > 0 else 0,
+            'freshness_stats': self.freshness_tracker.stats(),
+            'slippage_stats': self.slippage_model.stats(),
             'trade_history': [
                 {
-                    'timestamp': t['timestamp'].isoformat(),
-                    'market': t['market'],
-                    'outcome': t['outcome'],
-                    'shares': t['shares'],
-                    'price': t['price'],
-                    'pnl': t['pnl']
+                    'timestamp':    t['timestamp'],
+                    'market':       t['market'],
+                    'outcome':      t['outcome'],
+                    'shares':       round(t['shares'], 4),
+                    'quoted_price': round(t['quoted_price'], 4),
+                    'fill_price':   round(t['fill_price'], 4),
+                    'slippage_pct': round(t['slippage_pct'] * 100, 4),
+                    'quote_age_s':  round(t['quote_age_s'], 2),
+                    'fill_reason':  t['fill_reason'],
+                    'pnl':          round(t['pnl'], 4),
                 }
                 for t in self.trade_history
             ]
         }
-        
+
         filename = f"simulation_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         with open(filename, 'w') as f:
             json.dump(results, f, indent=2)
-        
+
         print(f"\n💾 Results saved to: {filename}")
 
 
 async def main():
     """Main entry point for paper trading"""
-    
-    # Configure paper trading
+
+    parser = argparse.ArgumentParser(description="Polymarket Paper Trading Simulator")
+    parser.add_argument(
+        "--fast", action="store_true",
+        help="Demo mode: 3 simulated minutes, 0.05s tick — completes in ~30s"
+    )
+    parser.add_argument(
+        "--duration", type=int, default=60,
+        help="Simulated duration in minutes (default: 60)"
+    )
+    args = parser.parse_args()
+
+    if args.fast:
+        duration = 3
+        interval = 0.05
+        print("\n" + "="*80)
+        print("🎮 PAPER TRADING SIMULATOR  [FAST / DEMO MODE]")
+        print("="*80)
+        print("Simulating 3 minutes of markets in ~30 seconds")
+        print("Press Ctrl+C to stop early")
+        print("="*80 + "\n")
+    else:
+        duration = args.duration
+        interval = 5
+        print("\n" + "="*80)
+        print("🎮 PAPER TRADING SIMULATOR")
+        print("="*80)
+        print(f"Simulating {duration} minutes  |  tick every {interval}s real time")
+        print("Press Ctrl+C to stop early  |  use --fast for a quick demo")
+        print("="*80 + "\n")
+
     config = {
         'starting_balance': 1000.0,
-        
+        'update_interval_seconds': interval,
+
         'strategy_config': {
             'momentum_buy_threshold': 0.05,
             'momentum_sell_threshold': -0.05,
@@ -473,7 +510,7 @@ async def main():
             'base_position_size': 10.0,
             'max_position_size': 50.0,
         },
-        
+
         'risk_config': {
             'max_daily_loss': 100.0,
             'max_total_exposure': 500.0,
@@ -481,46 +518,28 @@ async def main():
             'max_position_size': 50.0,
             'stop_loss_pct': 0.20,
         },
-        
-        'update_interval_seconds': 5,  # Fast simulation
 
-        # Quote freshness gating
-        # Trades on quotes older than this are blocked entirely
         'freshness_config': {
-            'max_age_seconds': 5.0,    # block anything older than 5s
+            'max_age_seconds': 5.0,
         },
 
-        # Execution realism / slippage model
         'slippage_config': {
-            'base_slippage':      0.005,   # 0.5% base market impact
-            'spread_half':        0.003,   # half the bid-ask spread
-            'no_fill_prob':       0.25,    # 25% chance of no-fill on limit orders
-            'adverse_fill_prob':  0.15,    # 15% chance of adverse fill
-            'adverse_multiplier': 3.0,     # adverse fills are 3x worse
-            'taker_fee':          0.002,   # 0.2% taker fee
-            'maker_fee':          0.001,   # 0.1% maker fee
+            'base_slippage':      0.005,
+            'spread_half':        0.003,
+            'no_fill_prob':       0.25,
+            'adverse_fill_prob':  0.15,
+            'adverse_multiplier': 3.0,
+            'taker_fee':          0.002,
+            'maker_fee':          0.001,
         },
     }
-    
-    # Setup logging
+
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s'
     )
-    
-    # Run simulation
+
     simulator = PaperTradingSimulator(config)
-    
-    # You can customize duration
-    duration = 60  # Run for 60 minutes (1 hour)
-    
-    print("\n" + "="*80)
-    print("🎮 PAPER TRADING SIMULATOR")
-    print("="*80)
-    print(f"This will simulate {duration} minutes of trading")
-    print("Press Ctrl+C to stop early")
-    print("="*80 + "\n")
-    
     await simulator.run_simulation(duration_minutes=duration)
 
 

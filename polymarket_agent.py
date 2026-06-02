@@ -5,6 +5,7 @@ A modular trading bot that monitors and trades on Polymarket's 5-minute predicti
 """
 
 import asyncio
+import copy
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
@@ -175,10 +176,10 @@ class BaseStrategy:
         self.market_history: Dict[str, List[MarketData]] = {}
     
     def update_market_data(self, market: MarketData):
-        """Store market data for analysis"""
+        """Store a snapshot of market data for analysis"""
         if market.market_id not in self.market_history:
             self.market_history[market.market_id] = []
-        self.market_history[market.market_id].append(market)
+        self.market_history[market.market_id].append(copy.deepcopy(market))
         
         # Keep only recent history (last 30 updates)
         if len(self.market_history[market.market_id]) > 30:
