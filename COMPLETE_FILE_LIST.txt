@@ -1,0 +1,84 @@
+📦 POLYMARKET TRADING AGENT - COMPLETE FILE LIST
+================================================
+
+You should have these 9 files:
+
+CORE FILES (Main Bot):
+├── 📄 polymarket_agent.py       - Main trading bot code
+├── 📄 custom_strategies.py      - Additional trading strategies  
+├── 📄 config.py                 - Pre-made configurations
+└── 📄 requirements.txt          - Python packages needed
+
+BEGINNER FILES (Start Here!):
+├── 📘 QUICK_START.md           - One-page cheat sheet ⭐ READ THIS FIRST
+├── 📗 SETUP_GUIDE.md           - Detailed step-by-step setup (for complete beginners)
+├── 📙 README.md                - Full documentation
+├── 🎮 paper_trading.py         - Simulation mode (test without API) ⭐ RUN THIS FIRST
+└── 🔍 check_setup.py           - Verify your installation
+
+RECOMMENDED ORDER:
+1. Read QUICK_START.md (5 min)
+2. Follow SETUP_GUIDE.md (45 min)
+3. Run check_setup.py to verify
+4. Test with paper_trading.py (1 hour)
+5. Read README.md for deep dive
+6. (Optional) Get API and go live
+
+QUICK TERMINAL COMMANDS:
+========================
+
+# First time setup:
+cd ~/Desktop
+mkdir polymarket-agent
+cd polymarket-agent
+# (Move downloaded files here)
+python3.11 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+# Verify everything works:
+python check_setup.py
+
+# Start paper trading (safe!):
+python paper_trading.py
+
+# Daily use:
+cd ~/Desktop/polymarket-agent
+source venv/bin/activate
+python paper_trading.py
+
+GETTING STARTED IN 3 STEPS:
+===========================
+
+STEP 1: Setup (30 min)
+- Install Python 3.11
+- Create virtual environment  
+- Install packages
+- Run check_setup.py
+
+STEP 2: Learn (1-2 weeks)
+- Run paper trading simulations
+- Watch how it trades
+- Understand the strategies
+- Tweak configurations
+
+STEP 3: Live (optional)
+- Get API credentials from Polymarket
+- Start with $10-50 maximum
+- Use CONSERVATIVE_CONFIG
+- Monitor constantly
+
+⚠️ SAFETY REMINDER:
+- Start with paper trading (no real money)
+- Test for at least 2 weeks
+- Only use money you can afford to lose
+- Set conservative risk limits
+- Monitor the bot frequently
+
+💡 HELP:
+- Stuck? Read SETUP_GUIDE.md
+- Quick reference? Check QUICK_START.md  
+- Deep dive? Read README.md
+- Check installation? Run check_setup.py
+
+Good luck! 🚀
