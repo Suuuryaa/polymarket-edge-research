@@ -256,7 +256,8 @@ class PaperTradingSimulator:
                 return False
 
             shares_to_sell = min(order.size / actual_price, position.shares)
-            sell_value     = shares_to_sell * actual_price - (shares_to_sell * actual_price * self.slippage_model.taker_fee)
+            fee_rate       = self.slippage_model.taker_fee if not self.naive_mode else 0.0
+            sell_value     = shares_to_sell * actual_price - (shares_to_sell * actual_price * fee_rate)
 
             cost_basis = shares_to_sell * position.avg_price
             pnl        = sell_value - cost_basis
@@ -287,7 +288,7 @@ class PaperTradingSimulator:
                 'pnl':            pnl,
             })
 
-            if position.shares < 0.01:
+            if position.shares < 0.01 and position in self.positions:
                 self.positions.remove(position)
 
             self.logger.info(

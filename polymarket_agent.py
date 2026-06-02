@@ -7,10 +7,13 @@ A modular trading bot that monitors and trades on Polymarket's 5-minute predicti
 import asyncio
 import copy
 import logging
+import os
+import signal as _signal
+from collections import deque
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 import json
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field
 from enum import Enum
 import aiohttp
 import time
@@ -167,23 +170,34 @@ class PolymarketClient:
 # Trading Strategies
 # ============================================================================
 
+@dataclass
+class PriceSnapshot:
+    """Lightweight price snapshot — replaces deepcopy of full MarketData"""
+    market_id: str
+    prices: Dict[str, float]
+    last_update: datetime
+
+
 class BaseStrategy:
     """Base class for trading strategies"""
-    
+
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.logger = logging.getLogger(__name__)
-        self.market_history: Dict[str, List[MarketData]] = {}
-    
+        # deque(maxlen=30) auto-evicts old entries — no manual slicing, O(1) append
+        self.market_history: Dict[str, deque] = {}
+
     def update_market_data(self, market: MarketData):
-        """Store a snapshot of market data for analysis"""
+        """Store a lightweight price snapshot — avoids deepcopy overhead"""
         if market.market_id not in self.market_history:
-            self.market_history[market.market_id] = []
-        self.market_history[market.market_id].append(copy.deepcopy(market))
-        
-        # Keep only recent history (last 30 updates)
-        if len(self.market_history[market.market_id]) > 30:
-            self.market_history[market.market_id] = self.market_history[market.market_id][-30:]
+            self.market_history[market.market_id] = deque(maxlen=30)
+        self.market_history[market.market_id].append(
+            PriceSnapshot(
+                market_id=market.market_id,
+                prices=dict(market.prices),   # shallow copy — only the dict
+                last_update=market.last_update,
+            )
+        )
     
     def generate_signals(self, markets: List[MarketData]) -> List[TradeSignal]:
         """Generate trading signals - override in subclass"""
@@ -216,18 +230,17 @@ class MomentumStrategy(BaseStrategy):
         
         return signals
     
-    def _check_momentum(self, market: MarketData, outcome: str, 
-                       history: List[MarketData]) -> Optional[TradeSignal]:
+    def _check_momentum(self, market: MarketData, outcome: str,
+                       history) -> Optional[TradeSignal]:
         """Check if there's momentum signal for this outcome"""
-        
-        # Get recent prices
-        prices = [m.prices.get(outcome, 0) for m in history[-5:]]
-        
+
+        prices = [s.prices.get(outcome, 0.0) for s in history][-5:]
+
         if len(prices) < 3:
             return None
-        
-        # Calculate price change rate
-        recent_change = (prices[-1] - prices[-3]) / prices[-3] if prices[-3] > 0 else 0
+
+        base = prices[-3]
+        recent_change = (prices[-1] - base) / base if base > 0 else 0.0
         
         # Thresholds from config
         buy_threshold = self.config.get('momentum_buy_threshold', 0.05)  # 5% rise
@@ -294,46 +307,44 @@ class RiskManager:
         self.daily_pnl = 0.0
         self.daily_start = datetime.now().date()
         
-    def check_order(self, order: Order, current_positions: List[Position]) -> tuple[bool, str]:
-        """
-        Check if order passes risk limits
-        Returns (approved, reason)
-        """
-        
+    def check_order(self, order: Order, current_positions: List[Position]) -> Tuple[bool, str]:
+        """Check if order passes risk limits. Returns (approved, reason)."""
+
         # Check daily loss limit
         max_daily_loss = self.config.get('max_daily_loss', 500.0)
         if self.daily_pnl < -max_daily_loss:
             return False, f"Daily loss limit reached: ${abs(self.daily_pnl):.2f}"
-        
+
         # Check position size
         max_position = self.config.get('max_position_size', 100.0)
         if order.size > max_position:
             return False, f"Order size ${order.size:.2f} exceeds max ${max_position:.2f}"
-        
-        # Check total exposure
-        current_exposure = sum(p.shares * p.current_price for p in current_positions)
+
+        # Build index once — O(n) once instead of O(n) per lookup
+        total_exposure = 0.0
+        market_exposure = 0.0
+        for p in current_positions:
+            value = p.shares * p.current_price
+            total_exposure += value
+            if p.market_id == order.market_id:
+                market_exposure += value
+
         max_exposure = self.config.get('max_total_exposure', 1000.0)
-        
-        if current_exposure + order.size > max_exposure:
-            return False, f"Total exposure would exceed limit: ${current_exposure + order.size:.2f} > ${max_exposure:.2f}"
-        
-        # Check per-market limits
-        market_positions = [p for p in current_positions if p.market_id == order.market_id]
-        market_exposure = sum(p.shares * p.current_price for p in market_positions)
+        if total_exposure + order.size > max_exposure:
+            return False, f"Total exposure would exceed limit: ${total_exposure + order.size:.2f} > ${max_exposure:.2f}"
+
         max_per_market = self.config.get('max_per_market', 200.0)
-        
         if market_exposure + order.size > max_per_market:
             return False, f"Market exposure limit: ${market_exposure + order.size:.2f} > ${max_per_market:.2f}"
-        
+
         return True, "OK"
-    
+
     def update_daily_pnl(self, pnl: float):
-        """Update daily P&L tracking"""
-        # Reset if new day
-        if datetime.now().date() > self.daily_start:
+        """Update daily P&L — uses single timestamp to avoid midnight race"""
+        today = datetime.utcnow().date()   # UTC — no timezone drift on cloud instances
+        if today > self.daily_start:
             self.daily_pnl = 0.0
-            self.daily_start = datetime.now().date()
-        
+            self.daily_start = today
         self.daily_pnl += pnl
         self.logger.info(f"Daily P&L: ${self.daily_pnl:.2f}")
 
@@ -478,46 +489,58 @@ class PolymarketAgent:
 # ============================================================================
 
 async def main():
-    """Main entry point"""
-    
-    # Load configuration
+    """Main entry point — credentials loaded from environment, never hardcoded"""
+
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    api_key    = os.environ.get('POLYMARKET_API_KEY')
+    api_secret = os.environ.get('POLYMARKET_API_SECRET')
+
+    if not api_key or not api_secret:
+        raise SystemExit(
+            "\n❌  Missing credentials.\n"
+            "    Set POLYMARKET_API_KEY and POLYMARKET_API_SECRET in your .env file.\n"
+            "    Copy .env.example → .env and fill in your testnet keys.\n"
+        )
+
     config = {
-        # API credentials (REPLACE WITH YOUR CREDENTIALS)
-        'api_key': 'YOUR_API_KEY_HERE',
-        'api_secret': 'YOUR_API_SECRET_HERE',
-        'testnet': True,  # Set to False for real trading
-        
-        # Strategy
+        'api_key':    api_key,
+        'api_secret': api_secret,
+        'testnet':    os.environ.get('TESTNET_MODE', 'true').lower() != 'false',
+
         'strategy': 'momentum',
         'strategy_config': {
-            'momentum_buy_threshold': 0.05,  # 5% price rise
-            'momentum_sell_threshold': -0.05,  # 5% price fall
-            'min_confidence': 0.6,
-            'base_position_size': 10.0,
-            'max_position_size': 50.0,
+            'momentum_buy_threshold':  float(os.environ.get('MOMENTUM_BUY_THRESHOLD',  '0.05')),
+            'momentum_sell_threshold': float(os.environ.get('MOMENTUM_SELL_THRESHOLD', '-0.05')),
+            'min_confidence':          float(os.environ.get('MIN_CONFIDENCE',          '0.6')),
+            'base_position_size':      float(os.environ.get('BASE_POSITION_SIZE',      '10.0')),
+            'max_position_size':       float(os.environ.get('MAX_POSITION_SIZE',       '50.0')),
         },
-        
-        # Risk management
+
         'risk_config': {
-            'max_daily_loss': 100.0,  # Max $100 loss per day
-            'max_total_exposure': 500.0,  # Max $500 total exposure
-            'max_per_market': 100.0,  # Max $100 per market
-            'max_position_size': 50.0,  # Max $50 per position
-            'stop_loss_pct': 0.20,  # 20% stop loss
+            'max_daily_loss':      float(os.environ.get('MAX_DAILY_LOSS',      '100.0')),
+            'max_total_exposure':  float(os.environ.get('MAX_TOTAL_EXPOSURE',  '500.0')),
+            'max_per_market':      float(os.environ.get('MAX_PER_MARKET',      '100.0')),
+            'max_position_size':   float(os.environ.get('MAX_POSITION_SIZE',   '50.0')),
+            'stop_loss_pct':       float(os.environ.get('STOP_LOSS_PCT',       '0.20')),
         },
-        
-        # Execution
-        'update_interval_seconds': 10,  # Check every 10 seconds
+
+        'update_interval_seconds': int(os.environ.get('UPDATE_INTERVAL_SECONDS', '10')),
     }
-    
-    # Create and start agent
+
     agent = PolymarketAgent(config)
-    
-    try:
-        await agent.start()
-    except KeyboardInterrupt:
-        print("\nShutting down...")
+    loop  = asyncio.get_event_loop()
+
+    # Graceful shutdown on SIGTERM / SIGINT — cancels pending orders before exit
+    async def _shutdown(sig_name: str):
+        logging.getLogger(__name__).info(f"Received {sig_name} — shutting down gracefully...")
         await agent.stop()
+
+    for sig in (_signal.SIGTERM, _signal.SIGINT):
+        loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(_shutdown(s.name)))
+
+    await agent.start()
 
 
 if __name__ == "__main__":

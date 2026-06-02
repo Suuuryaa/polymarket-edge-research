@@ -222,10 +222,10 @@ class SlippageModel:
         fill_price = max(0.01, min(0.99, fill_price))
         actual_slippage = fill_price - quoted_price
 
-        # Fees
+        # Fees — BUY costs more, SELL receives less
         fee_rate = self.taker_fee if is_market_order else self.maker_fee
         fee = size * fee_rate
-        cost = size + fee if side == "BUY" else -(size - fee)
+        cost = size + fee if side == "BUY" else size - fee
 
         result = FillResult(
             filled=True,
