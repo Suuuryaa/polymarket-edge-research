@@ -11,7 +11,7 @@ based on findings from the Reddit thread:
 import random
 import logging
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 
@@ -33,7 +33,7 @@ class QuoteSnapshot:
 
     @property
     def age_seconds(self) -> float:
-        return (datetime.now() - self.captured_at).total_seconds()
+        return (datetime.now(timezone.utc) - self.captured_at).total_seconds()
 
 
 class QuoteFreshnessTracker:
