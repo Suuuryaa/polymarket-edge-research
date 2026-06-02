@@ -73,28 +73,68 @@ def windows_to_candles(history: List[Window]) -> List[Candle]:
 
 # ── Snipe signal (T-10s simulation) ──────────────────────────────────────────
 
+def simulate_t10_price(window: Window) -> float:
+    """
+    Realistic T-10s price simulation based on community-observed win rates.
+
+    Key insight: at T-10s, price hasn't always "committed" to the final direction.
+    Reversal probability depends on how decisive the final move was:
+      delta > 0.10%  → 3%  chance wrong direction (nearly locked in)
+      delta 0.05-0.10% → 8%  chance wrong direction
+      delta 0.02-0.05% → 18% chance wrong direction
+      delta < 0.02%  → 40% chance wrong direction (coin flip territory)
+
+    This produces ~68-72% win rate matching real community data vs fake 97%.
+    """
+    close = window.close_price
+    open_ = window.open_price
+    final_delta = close - open_
+    abs_delta_pct = abs(final_delta / open_ * 100)
+
+    # Reversal probability: chance that T-10 price points OPPOSITE to final outcome
+    if abs_delta_pct >= 0.10:
+        reversal_prob = 0.03
+    elif abs_delta_pct >= 0.05:
+        reversal_prob = 0.08
+    elif abs_delta_pct >= 0.02:
+        reversal_prob = 0.18
+    else:
+        reversal_prob = 0.40
+
+    # Decide if this window has a reversal at T-10
+    if random.random() < reversal_prob:
+        # T-10 price points the WRONG direction — small counter-move
+        counter_move = abs(final_delta) * random.uniform(0.1, 0.5)
+        t10_delta = -final_delta * 0.3 + (1 if final_delta < 0 else -1) * counter_move
+    else:
+        # Normal: T-10 at ~75-90% of final move
+        progress = random.uniform(0.70, 0.92)
+        noise = random.gauss(0, abs(final_delta) * 0.04 + open_ * 0.00003)
+        t10_delta = final_delta * progress + noise
+
+    return open_ + t10_delta
+
+
 def snipe_signal(
     window: Window,
     history: List[Window],
     min_confidence: float = 0.30,
 ) -> Optional[Signal]:
     """
-    Simulate T-10s snipe: we know the window open price and the price now
-    (10s before close = close_price with small random noise to simulate
-    the real BTC price at T-10s, not exactly at close).
+    Simulate T-10s snipe with realistic price uncertainty.
+    Uses reversal probability model calibrated to community-observed ~68-72% win rate.
     """
-    # At T-10s, price has moved ~80% of its final distance.
-    # Simulate: T-10 price = open + 0.85 * (close - open) + noise
-    close = window.close_price
     open_ = window.open_price
-    noise = random.gauss(0, abs(close - open_) * 0.05 + open_ * 0.00005)
-    price_at_t10 = open_ + 0.85 * (close - open_) + noise
+    close = window.close_price
+    price_at_t10 = simulate_t10_price(window)
 
     candles = windows_to_candles(history[-21:]) if history else []
-    # Simulate tick prices (3 ticks: T-20, T-15, T-10)
+
+    # Simulate tick trajectory leading to T-10
+    t10_progress = (price_at_t10 - open_) / (close - open_) if close != open_ else 0
     tick_prices = [
-        open_ + 0.60 * (close - open_),
-        open_ + 0.75 * (close - open_),
+        open_ + (close - open_) * max(0, t10_progress * 0.6),
+        open_ + (close - open_) * max(0, t10_progress * 0.8),
         price_at_t10,
     ]
 
