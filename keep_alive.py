@@ -4,6 +4,7 @@ Runs a tiny HTTP server so UptimeRobot can ping it every 5 minutes,
 preventing Replit from putting the repl to sleep.
 """
 
+import os
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -19,6 +20,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def keep_alive():
-    server = HTTPServer(("0.0.0.0", 8080), _Handler)
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), _Handler)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
