@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 WINDOW_SECONDS = 300
-BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
+KRAKEN_OHLC    = "https://api.kraken.com/0/public/OHLC"
 GAMMA_API      = "https://gamma-api.polymarket.com/events"
 OUTPUT_FILE    = "data/live_collection.csv"
 NOTIFY_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")  # optional Discord notification
@@ -57,34 +57,36 @@ def current_window_ts() -> int:
 
 
 def fetch_btc_candle(window_ts: int) -> dict:
+    # Kraken OHLC: interval=5 (minutes), since=window_ts
     params = urllib.parse.urlencode({
-        "symbol":    "BTCUSDT",
-        "interval":  "5m",
-        "startTime": window_ts * 1000,
-        "limit":     1,
+        "pair":     "XBTUSD",
+        "interval": 5,
+        "since":    window_ts - 300,
     })
     try:
-        with urllib.request.urlopen(f"{BINANCE_KLINES}?{params}", timeout=10) as r:
-            raw = json.loads(r.read())
-        if raw:
-            k = raw[0]
-            open_p  = float(k[1])
-            high_p  = float(k[2])
-            low_p   = float(k[3])
-            close_p = float(k[4])
-            volume  = float(k[5])
-            pct     = (close_p - open_p) / open_p * 100
-            return {
-                "btc_open":   open_p,
-                "btc_close":  close_p,
-                "btc_high":   high_p,
-                "btc_low":    low_p,
-                "btc_volume": volume,
-                "pct_change": pct,
-                "outcome":    "UP" if close_p >= open_p else "DOWN",
-            }
+        with urllib.request.urlopen(f"{KRAKEN_OHLC}?{params}", timeout=10) as r:
+            data = json.loads(r.read())
+        candles = data.get("result", {}).get("XXBTZUSD", [])
+        # Find the candle matching our window_ts
+        for k in candles:
+            if int(k[0]) == window_ts:
+                open_p  = float(k[1])
+                high_p  = float(k[2])
+                low_p   = float(k[3])
+                close_p = float(k[4])
+                volume  = float(k[6])
+                pct     = (close_p - open_p) / open_p * 100
+                return {
+                    "btc_open":   open_p,
+                    "btc_close":  close_p,
+                    "btc_high":   high_p,
+                    "btc_low":    low_p,
+                    "btc_volume": volume,
+                    "pct_change": pct,
+                    "outcome":    "UP" if close_p >= open_p else "DOWN",
+                }
     except Exception as e:
-        print(f"  ⚠️  Binance fetch error: {e}")
+        print(f"  ⚠️  Kraken fetch error: {e}")
     return {}
 
 
