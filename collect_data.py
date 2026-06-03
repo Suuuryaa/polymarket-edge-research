@@ -234,4 +234,6 @@ def main():
 
 
 if __name__ == "__main__":
+    from keep_alive import keep_alive
+    keep_alive()
     main()
