@@ -40,6 +40,7 @@ import urllib.request
 import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import List, Optional, Dict
 
 try:
@@ -62,6 +63,15 @@ BINANCE_KLINES   = "https://api.binance.com/api/v3/klines"
 BINANCE_TICKER   = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
 GAMMA_API        = "https://gamma-api.polymarket.com/events"
 MIN_SHARES       = 5            # Polymarket minimum
+
+BROWSER_HEADERS  = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Origin": "https://polymarket.com",
+    "Referer": "https://polymarket.com/",
+}
+_last_gamma_call: float = 0.0   # rate-limit Polymarket API to 1 req/s
+_GAMMA_MIN_INTERVAL = 1.0
 
 
 # ── Mode configs ──────────────────────────────────────────────────────────────
@@ -267,12 +277,24 @@ class PolyMarket:
     no_price:     float
 
 
+def _gamma_request(url: str) -> list:
+    """Rate-limited Polymarket gamma API call (1 req/s max)."""
+    global _last_gamma_call
+    wait = _GAMMA_MIN_INTERVAL - (time.time() - _last_gamma_call)
+    if wait > 0:
+        time.sleep(wait)
+    req = urllib.request.Request(url, headers=BROWSER_HEADERS)
+    with urllib.request.urlopen(req, timeout=8) as r:
+        result = json.loads(r.read())
+    _last_gamma_call = time.time()
+    return result
+
+
 def fetch_market(window_ts: int) -> Optional[PolyMarket]:
     slug = slug_from_ts(window_ts)
     params = urllib.parse.urlencode({"slug": slug})
     try:
-        with urllib.request.urlopen(f"{GAMMA_API}?{params}", timeout=8) as r:
-            events = json.loads(r.read())
+        events = _gamma_request(f"{GAMMA_API}?{params}")
         if not events:
             return None
         event = events[0]
@@ -280,10 +302,12 @@ def fetch_market(window_ts: int) -> Optional[PolyMarket]:
         if not markets:
             return None
         m = markets[0]
-        tokens = m.get("clobTokenIds", [])
+        raw_tokens = m.get("clobTokenIds", "[]")
+        tokens = json.loads(raw_tokens) if isinstance(raw_tokens, str) else raw_tokens
         yes_id = tokens[0] if len(tokens) > 0 else ""
         no_id  = tokens[1] if len(tokens) > 1 else ""
-        prices = m.get("outcomePrices", ["0.50", "0.50"])
+        raw_prices = m.get("outcomePrices", '["0.50","0.50"]')
+        prices = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
         return PolyMarket(
             market_id    = m.get("id", ""),
             slug         = slug,
@@ -292,7 +316,8 @@ def fetch_market(window_ts: int) -> Optional[PolyMarket]:
             yes_price    = float(prices[0]) if prices else 0.50,
             no_price     = float(prices[1]) if len(prices) > 1 else 0.50,
         )
-    except Exception:
+    except Exception as e:
+        print(f"  ⚠️  fetch_market error: {e}")
         return None
 
 
@@ -308,20 +333,53 @@ class PaperState:
     history:          List[Dict] = field(default_factory=list)
 
 
+MAX_BET = 500.0   # hard cap per trade regardless of bankroll size
+
 def calc_bet_size(state: PaperState, mode: ModeConfig, min_bet: float = 1.0) -> float:
     if mode.name == "aggressive" and mode.protect_principal:
-        # Only bet profits above original
         profits = state.bankroll - state.original_bankroll
         if profits <= 0:
-            return min(state.bankroll, state.original_bankroll * mode.bet_fraction)
-        return max(min_bet, profits)
-    return max(min_bet, state.bankroll * mode.bet_fraction)
+            raw = min(state.bankroll, state.original_bankroll * mode.bet_fraction)
+        else:
+            raw = max(min_bet, profits)
+    else:
+        raw = max(min_bet, state.bankroll * mode.bet_fraction)
+    return min(raw, MAX_BET)
 
 
 # ── Resolution check ──────────────────────────────────────────────────────────
 
+def check_resolution_polymarket(window_ts: int) -> Optional[str]:
+    """
+    Fetch actual Polymarket resolution — uses Chainlink oracle, same as payout.
+    Returns "UP", "DOWN", or None if not yet resolved.
+    """
+    slug = slug_from_ts(window_ts)
+    params = urllib.parse.urlencode({"slug": slug})
+    try:
+        events = _gamma_request(f"{GAMMA_API}?{params}")
+        if not events:
+            return None
+        markets = events[0].get("markets", [])
+        if not markets:
+            return None
+        m = markets[0]
+        if m.get("closed") and m.get("resolutionSource"):
+            outcomes = json.loads(m.get("outcomes", '[]')) if isinstance(m.get("outcomes"), str) else m.get("outcomes", [])
+            prices_raw = m.get("outcomePrices", '["0.5","0.5"]')
+            prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+            if prices and len(prices) >= 2:
+                if float(prices[0]) > 0.9:
+                    return "UP"
+                elif float(prices[1]) > 0.9:
+                    return "DOWN"
+    except Exception:
+        pass
+    return None
+
+
 def check_resolution_binance(window_ts: int) -> Optional[str]:
-    """Check UP/DOWN by fetching the 5-min candle that closes this window."""
+    """Fallback: infer UP/DOWN from Binance 5-min candle (may differ from Chainlink)."""
     params = urllib.parse.urlencode({
         "symbol": "BTCUSDT", "interval": "5m",
         "startTime": window_ts * 1000, "limit": 1,
@@ -336,6 +394,14 @@ def check_resolution_binance(window_ts: int) -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+def check_resolution(window_ts: int) -> Optional[str]:
+    """Check resolution: Polymarket (Chainlink-based) first, Binance fallback."""
+    outcome = check_resolution_polymarket(window_ts)
+    if outcome:
+        return outcome
+    return check_resolution_binance(window_ts)
 
 
 # ── TA loop ───────────────────────────────────────────────────────────────────
@@ -542,7 +608,7 @@ def trade_cycle(state: PaperState, mode: ModeConfig, dry_run: bool) -> bool:
         print(f"  Waiting {remaining:.0f}s for resolution...")
         time.sleep(remaining + 2)
 
-    outcome = check_resolution_binance(window_ts)
+    outcome = check_resolution(window_ts)
     if not outcome:
         print("  ⚠️  Could not determine outcome — marking unknown")
         return True
@@ -564,19 +630,34 @@ def trade_cycle(state: PaperState, mode: ModeConfig, dry_run: bool) -> bool:
     print(f"  P&L this trade: ${pnl:+.2f}  |  Bankroll: ${state.bankroll:.2f}")
     print(f"  Running: {state.wins}/{state.trades} wins ({win_rate:.1f}%)  EV/dollar: {ev:+.4f}")
 
-    state.history.append({
-        "window_ts": window_ts,
-        "side":      signal.side,
-        "delta_pct": signal.window_delta_pct,
-        "confidence": signal.confidence,
+    trade_record = {
+        "window_ts":   window_ts,
+        "side":        signal.side,
+        "delta_pct":   signal.window_delta_pct,
+        "confidence":  signal.confidence,
         "token_price": fill["token_price"],
-        "outcome":   outcome,
-        "won":       won,
-        "pnl":       pnl,
-        "bankroll":  state.bankroll,
-    })
+        "outcome":     outcome,
+        "won":         won,
+        "pnl":         pnl,
+        "bankroll":    state.bankroll,
+    }
+    state.history.append(trade_record)
+    _append_trade_log(trade_record)
 
     return True
+
+
+def _append_trade_log(record: dict):
+    """Persist every trade to disk so results survive terminal close."""
+    import csv
+    log_path = Path("data/dry_run_trades.csv")
+    log_path.parent.mkdir(exist_ok=True)
+    write_header = not log_path.exists() or log_path.stat().st_size == 0
+    with open(log_path, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(record.keys()))
+        if write_header:
+            w.writeheader()
+        w.writerow(record)
 
 
 def main():
@@ -605,10 +686,13 @@ def main():
     print(f"  Bankroll: ${state.bankroll:.2f}  |  Min confidence: {mode.min_confidence:.0%}")
     print(f"{'='*60}")
 
-    # Start Chainlink oracle WebSocket
+    # Start Chainlink oracle WebSocket early — must be running at next window boundary
+    # to record the open price Polymarket resolves against.
     print("  Starting Chainlink oracle WebSocket...")
     _oracle.start()
-    time.sleep(2)  # allow connection to establish
+    time.sleep(3)  # allow WebSocket handshake to complete
+    if _oracle.price == 0:
+        print("  ⚠️  Chainlink oracle not yet receiving prices — will use Binance fallback")
 
     try:
         while True:

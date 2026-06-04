@@ -211,7 +211,7 @@ def analyze(
 
     final_dir = "UP" if score > 0 else "DOWN"
     token_price = token_price_from_delta(abs_delta)
-    token_price = min(0.97, token_price)   # cap at $0.97 — below that we can still profit
+    token_price = min(0.93, token_price)   # cap: at 2% fee, >$0.98 is negative EV; 0.93 gives margin
 
     return Signal(
         direction       = final_dir,
@@ -224,16 +224,23 @@ def analyze(
     )
 
 
-def min_win_rate_needed(token_price: float) -> float:
-    """
-    Break-even win rate at a given token price.
-    Win pays $1.00, lose forfeits cost.
-    EV = 0  →  win_rate * (1 - price) = (1 - win_rate) * price
-    Solve: win_rate = price
-    """
-    return token_price
+# Polymarket taker fee for crypto markets (crypto_fees_v2 schedule).
+# Empirically verify on first live trade — use 2% conservatively.
+# At 7% (worst case API field), tokens >$0.935 have negative EV.
+TAKER_FEE = 0.02
 
 
-def expected_value(token_price: float, win_rate: float) -> float:
-    """EV per dollar risked."""
-    return win_rate * (1.0 - token_price) - (1.0 - win_rate) * token_price
+def min_win_rate_needed(token_price: float, fee: float = TAKER_FEE) -> float:
+    """
+    Break-even win rate accounting for taker fee.
+    Effective cost per share = price * (1 + fee).
+    EV = 0  →  win_rate * 1.0 = effective_cost
+    Solve: win_rate = price * (1 + fee)
+    """
+    return token_price * (1.0 + fee)
+
+
+def expected_value(token_price: float, win_rate: float, fee: float = TAKER_FEE) -> float:
+    """EV per dollar risked, after taker fee."""
+    effective_cost = token_price * (1.0 + fee)
+    return win_rate * (1.0 - effective_cost) - (1.0 - win_rate) * effective_cost

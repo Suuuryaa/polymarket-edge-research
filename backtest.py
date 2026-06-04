@@ -248,11 +248,13 @@ def run_backtest(windows: List[Window], cfg: BacktestConfig) -> Tuple[List[Trade
         won = (signal.side == "BUY_YES" and window.outcome == "UP") or \
               (signal.side == "BUY_NO"  and window.outcome == "DOWN")
 
-        # Binary market P&L
+        # Binary market P&L (2% taker fee applied to cost)
+        from strategy import TAKER_FEE
+        fee = fill_price * cfg.position_size * TAKER_FEE
         if won:
-            pnl = (1.0 - fill_price) * cfg.position_size
+            pnl = (1.0 - fill_price) * cfg.position_size - fee
         else:
-            pnl = -fill_price * cfg.position_size
+            pnl = -fill_price * cfg.position_size - fee
 
         balance += pnl
         bucket_analyser.record_trade(quote_age if not cfg.naive_mode else 0.0, pnl)
