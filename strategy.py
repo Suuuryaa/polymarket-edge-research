@@ -122,9 +122,13 @@ def analyze(
     abs_delta = abs(delta_pct)
     direction = 1 if delta_pct > 0 else -1
 
+    # At 7% taker fee, >0.10% delta → token ~$0.93, break-even = 99.5%.
+    # Win rate of 98.1% is not enough margin — skip these trades.
+    # Best risk/reward zone: 0.02–0.10% delta.
     if abs_delta > 0.10:
-        w = 7
-    elif abs_delta > 0.02:
+        return None   # fee kills edge at extreme confidence
+
+    if abs_delta > 0.02:
         w = 5
     elif abs_delta > 0.005:
         w = 3
@@ -225,9 +229,11 @@ def analyze(
 
 
 # Polymarket taker fee for crypto markets (crypto_fees_v2 schedule).
-# Empirically verify on first live trade — use 2% conservatively.
-# At 7% (worst case API field), tokens >$0.935 have negative EV.
-TAKER_FEE = 0.02
+# feeSchedule.rate=0.07 with takerOnly=True confirmed from market API.
+# Maker orders (GTC limit) pay 0% fee — try limit first in live execution.
+# At 7% taker fee, tokens >$0.935 = negative EV even at 100% win rate.
+TAKER_FEE = 0.07
+MAKER_FEE = 0.00  # GTC limit orders pay no fee (rebateRate=0.2 gives small rebate)
 
 
 def min_win_rate_needed(token_price: float, fee: float = TAKER_FEE) -> float:
