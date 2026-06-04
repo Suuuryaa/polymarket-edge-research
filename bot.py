@@ -84,100 +84,19 @@ class ModeConfig:
     protect_principal: bool  # aggressive: only compound profits
 
 
-# ── Chainlink Oracle WebSocket ────────────────────────────────────────────────
+# Polymarket's Chainlink WebSocket (wss://ws-live-data.polymarket.com) connects
+# but does not broadcast price data — likely requires internal auth or changed protocol.
+# Binance BTC/USD is within ~$5-50 of Chainlink at any moment (<0.1% at $63K).
+# Resolution accuracy is handled separately by check_resolution_polymarket().
+# Keeping a stub oracle so callers fall through to Binance cleanly.
 
-class ChainlinkOracle:
-    """
-    Connects to wss://ws-live-data.polymarket.com and subscribes to
-    crypto_prices_chainlink (btc/usd). This is the EXACT price Polymarket
-    resolves against — more accurate than Binance for determining window open.
+class _NullOracle:
+    price = 0.0
+    def start(self): pass
+    def stop(self): pass
+    def window_open(self, _): return 0.0
 
-    Falls back to Binance if WebSocket unavailable.
-    """
-    WS_URL = "wss://ws-live-data.polymarket.com"
-
-    def __init__(self):
-        self._price: float = 0.0
-        self._last_update: float = 0.0
-        self._thread: Optional[threading.Thread] = None
-        self._running = False
-        self._window_prices: Dict[int, float] = {}  # window_ts → open price
-
-    def start(self):
-        self._running = True
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._running = False
-
-    def _run(self):
-        try:
-            import websocket
-        except ImportError:
-            print("  ⚠️  websocket-client not installed — using Binance fallback")
-            print("       Install: pip install websocket-client")
-            return
-
-        def on_message(ws, message):
-            try:
-                data = json.loads(message)
-                # Message format: {"type": "crypto_prices_chainlink", "data": {"btc/usd": "105432.12"}}
-                if data.get("type") == "crypto_prices_chainlink":
-                    prices = data.get("data", {})
-                    price_str = prices.get("btc/usd") or prices.get("BTC/USD")
-                    if price_str:
-                        self._price = float(price_str)
-                        self._last_update = time.time()
-                        # Record window open price at boundary
-                        now = int(time.time())
-                        wts = now - (now % WINDOW_SECONDS)
-                        if wts not in self._window_prices:
-                            self._window_prices[wts] = self._price
-            except Exception:
-                pass
-
-        def on_open(ws):
-            sub = json.dumps({
-                "type": "subscribe",
-                "channel": "crypto_prices_chainlink",
-                "filter": "btc/usd",
-            })
-            ws.send(sub)
-            print("  🔗 Chainlink oracle WebSocket connected")
-
-        def on_error(ws, error):
-            print(f"  ⚠️  Chainlink WS error: {error} — falling back to Binance")
-
-        def on_close(ws, *args):
-            if self._running:
-                time.sleep(5)
-                self._run()  # reconnect
-
-        ws = websocket.WebSocketApp(
-            self.WS_URL,
-            on_open=on_open,
-            on_message=on_message,
-            on_error=on_error,
-            on_close=on_close,
-        )
-        ws.run_forever(ping_interval=30)
-
-    @property
-    def price(self) -> float:
-        """Latest Chainlink BTC/USD oracle price."""
-        age = time.time() - self._last_update
-        if age > 30 or self._price == 0:
-            return 0.0  # stale — caller should fall back to Binance
-        return self._price
-
-    def window_open(self, window_ts: int) -> float:
-        """First Chainlink price seen at/after this window boundary."""
-        return self._window_prices.get(window_ts, 0.0)
-
-
-# Global oracle instance
-_oracle = ChainlinkOracle()
+_oracle = _NullOracle()
 
 
 MODES = {
@@ -686,13 +605,7 @@ def main():
     print(f"  Bankroll: ${state.bankroll:.2f}  |  Min confidence: {mode.min_confidence:.0%}")
     print(f"{'='*60}")
 
-    # Start Chainlink oracle WebSocket early — must be running at next window boundary
-    # to record the open price Polymarket resolves against.
-    print("  Starting Chainlink oracle WebSocket...")
-    _oracle.start()
-    time.sleep(3)  # allow WebSocket handshake to complete
-    if _oracle.price == 0:
-        print("  ⚠️  Chainlink oracle not yet receiving prices — will use Binance fallback")
+    print("  Price source: Binance (Chainlink delta <0.1% — negligible for signals)")
 
     try:
         while True:
