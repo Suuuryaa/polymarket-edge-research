@@ -66,16 +66,11 @@ Both trades were strong-signal windows where BTC moved clearly in one direction.
 | Live snipe bot | ✅ Done |
 | 0% fee limit orders | ✅ Done |
 | **Live trading** | 🟢 Active |
-| Silent fill bug fix | 🔄 In progress |
+| Silent fill bug fix | ✅ Done |
 | Auto-claim + compounding | 📋 Planned |
 
 ---
 
-## Known Issues
-
-**Silent fill bug:** Occasionally the API reports that an order timed out — but it actually filled on-chain without the bot knowing. The bot can end up holding tokens it doesn't know about. Fix is in progress.
-
----
 
 ## Quick Start
 
