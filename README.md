@@ -61,6 +61,14 @@ Seven indicators feed into the signal — window delta, momentum, acceleration, 
 
 ---
 
+## Security
+
+- **Never upload your `.env` file, private keys, or API credentials to GitHub**
+- Use a separate wallet with only the funds you intend to trade — not your main wallet
+- You are responsible for complying with Polymarket's Terms of Service and the laws in your country
+
+---
+
 ## Installation
 
 ```bash
