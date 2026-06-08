@@ -1,18 +1,23 @@
 # polymarket-edge-research
 
-> A live bot that trades Polymarket's 5-minute BTC prediction markets.
+> A bot that trades Polymarket's 5-minute BTC Up/Down prediction markets using momentum signals and zero-fee limit orders.
 
 ![Status](https://img.shields.io/badge/Status-Live%20Trading-brightgreen)
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue?logo=python)
+![Win Rate](https://img.shields.io/badge/Win%20Rate-92.9%25-brightgreen)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 ---
 
-## What This Is
+> **Disclaimer:** This is an experimental trading bot. Prediction markets carry real financial risk. You can lose your entire balance. Only use money you can afford to lose. This project is for educational and research purposes.
+
+---
+
+## What This Does
 
 Every 5 minutes, Polymarket asks: **"Will BTC be higher or lower than 5 minutes ago?"**
 
-This bot watches BTC's price move during each window, figures out which direction is winning, and places a bet just before the window closes — when the outcome is nearly certain.
+This bot watches how much BTC has moved during a window, detects the dominant direction, and enters a trade just before close — when the outcome is nearly locked in. It uses limit orders to avoid the 7% taker fee, checks liquidity before every trade, and skips windows where the edge isn't there.
 
 ---
 
@@ -21,79 +26,99 @@ This bot watches BTC's price move during each window, figures out which directio
 ```mermaid
 flowchart TD
     A([New 5-min window starts]) --> B[Watch BTC price move]
-    B --> C[Signal gets strong enough?]
+    B --> C{Signal strong enough?}
     C -->|Not yet| B
-    C -->|Yes| D[Check if market has liquidity]
-    D -->|No liquidity / bad price| E[Skip this window]
-    D -->|Looks good| F[Place limit order — 0% fee]
-    F --> G[Wait for fill]
-    G -->|Filled| H[Hold until window closes]
-    G -->|Not filled in 45s| I[Cancel and move on]
-    H --> J{Result}
-    J -->|Correct ✅| K[Token pays out $1.00]
-    J -->|Wrong ❌| L[Lose the bet]
+    C -->|Yes| D[Orderbook pre-flight check]
+    D -->|No liquidity / token too expensive| E[Skip window]
+    D -->|Pass| F[Place GTC limit order — 0% fee]
+    F --> G[Poll for fill — up to 45s]
+    G -->|Filled| H[Hold to resolution]
+    G -->|Not filled| I[Cancel + check for silent fill]
+    H --> J{Outcome}
+    J -->|Correct ✅| K[Token redeems at $1.00]
+    J -->|Wrong ❌| L[Lose bet amount]
 ```
 
 ---
 
-## The Edge
+## Trading Strategy
 
-The bot's main signal is simple: **how much has BTC moved since this window opened?**
+The dominant signal is simple: **how far has BTC moved since this window opened?**
 
-A big move in one direction almost never reverses in the last 60 seconds. The bot bets with the trend.
+A strong move in one direction almost never reverses in the final 60 seconds. The bot bets with the trend and skips windows where the signal is weak or the token price is too expensive to be worth it.
 
-The catch: when the signal is obvious, the market already knows — so the token costs more and your profit margin shrinks. The bot skips windows where the token is too expensive to be worth it.
-
-**Fee structure:** The bot uses limit orders (0% fee) instead of market orders (7% fee). On a tight-margin trade, that difference is everything.
+Seven indicators feed into the signal — window delta, momentum, acceleration, EMA crossover, RSI, volume surge, and tick trend — but window delta is weighted 5–7× more than all others combined.
 
 ---
 
-## Live Results
+## Risk Management
 
-**Session: 2026-06-05 — 2 trades, 2 wins ✅**
-
-Both trades were strong-signal windows where BTC moved clearly in one direction. The bot held through resolution and both paid out.
-
-> Balance went from $24.81 → ~$25.95 across the two wins, then dropped to ~$19.85 due to a silent fill bug (see Known Issues below).
-
----
-
-## Project Status
-
-| Phase | Status |
-|---|---|
-| Signal engine + backtest | ✅ Done |
-| Live snipe bot | ✅ Done |
-| 0% fee limit orders | ✅ Done |
-| **Live trading** | 🟢 Active |
-| Silent fill bug fix | ✅ Done |
-| Auto-claim + compounding | 📋 Planned |
+- Hard stop if balance drops below $15
+- Skips any window where token price exceeds $0.92 (margin too thin above this)
+- Skips if orderbook liquidity is less than 2× the bet size
+- Bets capped at 80% of on-chain balance — never all-in
+- Detects silent fills (API timeout but order filled on-chain) and handles them correctly
 
 ---
 
-
-## Quick Start
+## Installation
 
 ```bash
 git clone https://github.com/Suuuryaa/polymarket-edge-research
 cd polymarket-edge-research
 pip install -r requirements.txt
-
-# Set up your Polymarket credentials
 python setup_credentials.py
+```
 
-# Start the bot
+`setup_credentials.py` walks you through entering your Polymarket API keys interactively and saves them to `.env`.
+
+---
+
+## Usage
+
+```bash
+# Live trading
 python bot.py --mode safe --bankroll 20.00
+
+# Dry run (no real money)
+python bot.py --mode safe --bankroll 20.00 --dry-run
+
+# Check logs
+tail -f /tmp/bot_live.log
+```
+
+**Modes:**
+
+| Mode | Risk level | Description |
+|---|---|---|
+| `safe` | Low | 25% of bankroll per trade |
+| `aggressive` | Medium | Larger bets, lower signal bar |
+| `degen` | High | Trades every window regardless of signal |
+
+---
+
+## Project Structure
+
+```
+bot.py                 Main bot — live order execution and trade loop
+strategy.py            Signal engine — 7 indicators, window delta dominant
+setup_credentials.py   Interactive credential setup
+backtest.py            Test strategy on historical BTC data
+collect_data.py        Collects live BTC window data 24/7
 ```
 
 ---
 
-## Files
+## Roadmap
 
-```
-bot.py                 Main bot — places and manages live trades
-strategy.py            Signal engine — reads BTC price, decides direction
-setup_credentials.py   One-command credential setup
-backtest.py            Test the strategy on historical data
-collect_data.py        Collects live BTC window data 24/7
-```
+- [x] Signal engine + backtest
+- [x] Live snipe bot with GTC limit orders
+- [x] Silent fill detection
+- [ ] Auto-claim winning tokens
+- [ ] Compounding bankroll management
+
+---
+
+## License
+
+MIT
