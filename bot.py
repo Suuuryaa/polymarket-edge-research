@@ -55,7 +55,7 @@ from strategy import analyze, Candle, Signal, token_price_from_delta, min_win_ra
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 WINDOW_SECONDS   = 300          # 5-minute windows
-SNIPE_ENTRY_SECS = 10           # enter at T-10s
+SNIPE_ENTRY_SECS = 60           # enter at T-60s (market makers still quoting; T-10s has no liquidity)
 HARD_DEADLINE    = 5            # T-5s: must fire by here
 POLL_INTERVAL    = 2            # TA loop every 2s
 SPIKE_THRESHOLD  = 1.5          # immediate fire if score jumps by this
@@ -100,7 +100,7 @@ _oracle = _NullOracle()
 
 
 MODES = {
-    "safe":       ModeConfig("safe",       0.25,  0.30, False),
+    "safe":       ModeConfig("safe",       0.25,  0.60, False),
     "aggressive": ModeConfig("aggressive", 1.0,   0.20, True),   # bets profits only
     "degen":      ModeConfig("degen",      1.0,   0.00, False),  # all-in always
 }
@@ -353,7 +353,7 @@ def run_ta_loop(
             min_confidence    = mode.min_confidence,
         )
 
-        if signal:
+        if signal and abs(signal.window_delta_pct) >= 0.02:
             # Track best signal
             if best_signal is None or abs(signal.score) > abs(best_signal.score):
                 best_signal = signal
@@ -415,12 +415,15 @@ def dry_run_resolve(signal: Signal, outcome: str, fill: Dict) -> float:
 
 def live_execute(signal: Signal, market: PolyMarket, bet_size: float) -> Optional[Dict]:
     """
-    Execute a real order on Polymarket CLOB.
-    Primary: FOK market buy. Fallback: GTC limit at $0.95.
+    Execute a FOK market order on Polymarket CLOB V2.
+    FOK = Fill Or Kill: fills immediately at best available price, or cancels.
+    No resting orders on the book — prevents stale fills near window close.
     """
     try:
-        from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import OrderArgs, OrderType, TimeInForce
+        from py_clob_client_v2.client import ClobClient
+        from py_clob_client_v2 import (ApiCreds, SignatureTypeV2, PartialCreateOrderOptions,
+                                        MarketOrderArgsV2, OrderType,
+                                        BalanceAllowanceParams, AssetType)
 
         host        = "https://clob.polymarket.com"
         api_key     = os.environ.get("POLY_API_KEY", "")
@@ -428,35 +431,128 @@ def live_execute(signal: Signal, market: PolyMarket, bet_size: float) -> Optiona
         passphrase  = os.environ.get("POLY_API_PASSPHRASE", "")
         private_key = os.environ.get("POLY_PRIVATE_KEY", "")
         funder      = os.environ.get("POLY_FUNDER_ADDRESS", "")
-        sig_type    = int(os.environ.get("POLY_SIGNATURE_TYPE", "1"))
 
-        client = ClobClient(host, key=private_key, chain_id=137,
-                            creds={"key": api_key, "secret": api_secret, "passphrase": passphrase},
-                            signature_type=sig_type, funder=funder)
+        creds  = ApiCreds(api_key=api_key, api_secret=api_secret, api_passphrase=passphrase)
+        client = ClobClient(host, chain_id=137, key=private_key,
+                            creds=creds, signature_type=SignatureTypeV2.POLY_1271, funder=funder)
+
+        # Cap bet to 80% of actual on-chain balance
+        bal_info = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=SignatureTypeV2.POLY_1271))
+        actual_balance = int(bal_info.get("balance", 0)) / 1e6
+        max_bet = actual_balance * 0.80
+        bet_size = min(bet_size, max_bet)
+        print(f"  💰 On-chain balance: ${actual_balance:.2f}  |  Max bet: ${max_bet:.2f}")
+        if bet_size < 1.0:
+            print(f"  ⚠️  Balance too low (${actual_balance:.2f}) — skip")
+            return None
 
         token_id = market.yes_token_id if signal.side == "BUY_YES" else market.no_token_id
-        price    = signal.token_price
-        shares   = max(MIN_SHARES, int(bet_size / price))
 
-        # Primary: FOK market buy
+        # Check orderbook liquidity before placing — FOK silently fails when no asks exist
+        try:
+            ob = client.get_order_book(token_id)
+            asks = ob.get("asks", []) if isinstance(ob, dict) else []
+            # asks are sorted highest→lowest price; find lowest (best) ask
+            if asks:
+                best_ask = min(float(a["price"]) for a in asks)
+            else:
+                best_ask = None
+            if best_ask is None:
+                print(f"  ⚠️  No asks in orderbook — no liquidity, skipping")
+                return None
+            if best_ask > 0.92:
+                print(f"  ⚠️  Best ask ${best_ask:.3f} too expensive (>$0.92) — poor value, skipping")
+                return None
+            # Cap bet to available liquidity at best ask
+            best_ask_size = min(float(a["size"]) for a in asks if float(a["price"]) == best_ask) if asks else 0
+            available_usdc = best_ask_size * best_ask
+            if available_usdc < bet_size * 2:
+                print(f"  ⚠️  Only ${available_usdc:.2f} available (need 2x bet = ${bet_size*2:.2f}) — too thin, skipping")
+                return None
+            if bet_size > available_usdc * 0.70:
+                print(f"  📖 Best ask: ${best_ask:.3f}  |  Available: ${available_usdc:.2f} — capping bet to 70%")
+                bet_size = available_usdc * 0.70
+            else:
+                print(f"  📖 Best ask: ${best_ask:.3f}  |  Available: ${available_usdc:.2f}  |  Liquidity OK")
+        except Exception as ob_err:
+            print(f"  ⚠️  Orderbook check failed ({ob_err}) — proceeding anyway")
+
+        # Limit order at best ask — maker fee = 0%, no FOK rejection risk
+        limit_price = round(best_ask, 2)  # best_ask already fetched above
+        shares_to_buy = round(bet_size / limit_price, 1)
+        if shares_to_buy < MIN_SHARES:
+            print(f"  ⚠️  Too few shares ({shares_to_buy}) at ${limit_price:.3f} — skip")
+            return None
+
+        from py_clob_client_v2.clob_types import OrderArgs, OrderType as OT
         order_args = OrderArgs(
-            price=price, size=shares, side="BUY",
             token_id=token_id,
+            price=limit_price,
+            size=shares_to_buy,
+            side="BUY",
         )
-        resp = client.create_and_post_order(order_args)
-        if resp and resp.get("status") in ("matched", "filled"):
-            return {"filled": True, "token_price": price, "shares": shares, "cost": shares * price}
+        options = PartialCreateOrderOptions(tick_size="0.01", neg_risk=False)
+        print(f"  📝 Limit order: {shares_to_buy} shares @ ${limit_price:.3f} (GTC, 0% fee)")
+        resp = client.create_and_post_order(order_args, options)
 
-        # Fallback: GTC limit at $0.95 (become the liquidity)
-        limit_price = min(0.95, price + 0.03)
-        limit_args = OrderArgs(
-            price=limit_price, size=shares, side="BUY", token_id=token_id,
-        )
-        resp2 = client.create_and_post_order(limit_args)
-        return {"filled": True, "token_price": limit_price, "shares": shares, "cost": shares * limit_price}
+        if not resp:
+            print(f"  ⚠️  No response from order placement — skipping")
+            return None
+
+        order_id = resp.get("orderID") or resp.get("id") or resp.get("order_id")
+        status = resp.get("status", "unknown")
+        print(f"  🕐 Order placed (id={str(order_id)[:16]}…  status={status}) — polling for fill (45s)…")
+
+        # Poll for fill up to 45s, then cancel
+        fill_deadline = time.time() + 45
+        filled_size = 0.0
+        filled_price_avg = limit_price
+
+        while time.time() < fill_deadline:
+            time.sleep(3)
+            try:
+                order_status = client.get_order(order_id)
+                s = order_status.get("status", "")
+                filled_size = float(order_status.get("size_matched", 0) or 0)
+                if s in ("matched", "filled") or filled_size >= shares_to_buy * 0.95:
+                    actual_cost = filled_size * limit_price
+                    print(f"  ✅ Limit filled: {filled_size:.1f} shares @ ${limit_price:.3f} = ${actual_cost:.2f}")
+                    return {"filled": True, "token_price": limit_price, "shares": filled_size, "cost": actual_cost}
+                if s in ("cancelled", "canceled"):
+                    print(f"  ⚠️  Order cancelled by exchange — no fill")
+                    return None
+            except Exception as poll_err:
+                print(f"  ⚠️  Poll error: {poll_err}")
+
+        # Cancel unfilled order before window closes
+        print(f"  ⏱  45s elapsed — cancelling unfilled order…")
+        try:
+            client.cancel(order_id)
+        except Exception as cancel_err:
+            print(f"  ⚠️  Cancel error: {cancel_err}")
+
+        if filled_size >= MIN_SHARES:
+            actual_cost = filled_size * limit_price
+            print(f"  ✅ Partial fill kept: {filled_size:.1f} shares @ ${limit_price:.3f} = ${actual_cost:.2f}")
+            return {"filled": True, "token_price": limit_price, "shares": filled_size, "cost": actual_cost}
+
+        # Silent fill check — API sometimes reports timeout but order filled on-chain
+        try:
+            bal_after = int(client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=SignatureTypeV2.POLY_1271)).get("balance", 0)) / 1e6
+            balance_drop = actual_balance - bal_after
+            if balance_drop >= 1.0:
+                estimated_shares = round(balance_drop / limit_price, 1)
+                print(f"  🚨 SILENT FILL DETECTED — balance dropped ${balance_drop:.2f} despite API timeout")
+                print(f"  🚨 Estimated fill: ~{estimated_shares} shares @ ${limit_price:.3f}")
+                return {"filled": True, "token_price": limit_price, "shares": estimated_shares, "cost": balance_drop}
+        except Exception as bal_err:
+            print(f"  ⚠️  Post-cancel balance check failed: {bal_err}")
+
+        print(f"  ⚠️  Order cancelled — no fill, no money spent")
+        return None
 
     except ImportError:
-        print("  ⚠️  py-clob-client not installed. Run: pip install py-clob-client==0.34.5")
+        print("  ⚠️  py-clob-client-v2 not installed. Run: pip install py-clob-client-v2")
         return None
     except Exception as e:
         print(f"  ❌ Order failed: {e}")
@@ -500,12 +596,23 @@ def trade_cycle(state: PaperState, mode: ModeConfig, dry_run: bool) -> bool:
         print("  No signal generated — skip")
         return False
 
+    # Only trade medium+ delta — weak moves (<0.05%) have ~68% win rate, too risky
+    MIN_DELTA_PCT = 0.05
+    if abs(signal.window_delta_pct) < MIN_DELTA_PCT:
+        print(f"  ⚠️  Delta too weak ({signal.window_delta_pct:+.4f}%) — need >{MIN_DELTA_PCT}% — skip")
+        return False
+
     print(f"  Signal: {signal.side}  score={signal.score:+.1f}  conf={signal.confidence:.0%}  Δ={signal.window_delta_pct:+.4f}%")
     print(f"  Token price: ${signal.token_price:.3f}  (break-even win rate: {min_win_rate_needed(signal.token_price)*100:.1f}%)")
     for r in signal.reasons:
         print(f"    • {r}")
 
-    bet_size = calc_bet_size(state, mode)
+    # 50% bet on 100% confidence, otherwise standard safe mode (25%)
+    if signal.confidence >= 1.0:
+        bet_size = max(1.0, min(state.bankroll * 0.50, 500.0))
+        print(f"  🔥 100% confidence — betting 50%: ${bet_size:.2f}")
+    else:
+        bet_size = calc_bet_size(state, mode)
     print(f"  Bet size: ${bet_size:.2f}")
 
     # Execute
@@ -521,13 +628,25 @@ def trade_cycle(state: PaperState, mode: ModeConfig, dry_run: bool) -> bool:
         if not fill:
             return False
 
-    # Wait for resolution
+    # Wait for resolution — Polymarket oracle takes ~15-30s after close to settle
     remaining = close_ts - time.time()
     if remaining > 0:
-        print(f"  Waiting {remaining:.0f}s for resolution...")
+        print(f"  Waiting {remaining:.0f}s for window close...")
         time.sleep(remaining + 2)
 
-    outcome = check_resolution(window_ts)
+    outcome = None
+    print("  Polling Polymarket for resolution (up to 60s)...")
+    for attempt in range(12):  # try every 5s for up to 60s
+        outcome = check_resolution_polymarket(window_ts)
+        if outcome:
+            print(f"  🔗 Polymarket resolved: {outcome}")
+            break
+        time.sleep(5)
+
+    if not outcome:
+        print("  ⚠️  Polymarket not resolved yet — using Binance fallback (may differ from oracle)")
+        outcome = check_resolution_binance(window_ts)
+
     if not outcome:
         print("  ⚠️  Could not determine outcome — marking unknown")
         return True
@@ -546,7 +665,20 @@ def trade_cycle(state: PaperState, mode: ModeConfig, dry_run: bool) -> bool:
 
     icon = "✅" if won else "❌"
     print(f"\n  {icon} {outcome} — {'WIN' if won else 'LOSS'}")
-    print(f"  P&L this trade: ${pnl:+.2f}  |  Bankroll: ${state.bankroll:.2f}")
+    if dry_run:
+        print(f"  P&L this trade: ${pnl:+.2f}  |  Bankroll: ${state.bankroll:.2f}")
+    else:
+        # Show real on-chain balance after trade
+        try:
+            from py_clob_client_v2.client import ClobClient
+            from py_clob_client_v2 import ApiCreds, SignatureTypeV2, BalanceAllowanceParams, AssetType
+            _creds  = ApiCreds(api_key=os.environ.get("POLY_API_KEY",""), api_secret=os.environ.get("POLY_API_SECRET",""), api_passphrase=os.environ.get("POLY_API_PASSPHRASE",""))
+            _client = ClobClient("https://clob.polymarket.com", chain_id=137, key=os.environ.get("POLY_PRIVATE_KEY",""),
+                                  creds=_creds, signature_type=SignatureTypeV2.POLY_1271, funder=os.environ.get("POLY_FUNDER_ADDRESS",""))
+            _bal = int(_client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=SignatureTypeV2.POLY_1271)).get("balance", 0)) / 1e6
+            print(f"  On-chain balance after trade: ${_bal:.2f}")
+        except Exception:
+            pass
     print(f"  Running: {state.wins}/{state.trades} wins ({win_rate:.1f}%)  EV/dollar: {ev:+.4f}")
 
     trade_record = {
